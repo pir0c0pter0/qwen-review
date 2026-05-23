@@ -1458,6 +1458,50 @@ test("hook reviews UNTRACKED new files (not shortcut-skipped, included in prompt
   }
 });
 
+test("hook excludes UNTRACKED .env from diff body (no secret leak)", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    // Add one real source change so the hook proceeds
+    fs.writeFileSync(path.join(repo, "src.js"), "export const x = 1;\n");
+    execSync("git add src.js", { cwd: repo });
+    // Untracked .env with a non-pattern-matching secret (so file-skip is the only protection)
+    fs.writeFileSync(
+      path.join(repo, ".env"),
+      "DATABASE_URL=postgres://u:p@host/db\nINTERNAL_PASSWORD=hunter2-not-a-known-token-pattern\n"
+    );
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "touched src.js and added .env", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
+    const sent = JSON.parse(captured.opts.body).messages[0].content;
+    // Skip placeholder appears
+    assert.match(sent, /\[diff excluded: sensitive path\]/);
+    assert.match(sent, /\[file excluded: sensitive path\]/);
+    // Secret literals are NOT in the prompt
+    assert.doesNotMatch(sent, /hunter2-not-a-known-token-pattern/);
+    assert.doesNotMatch(sent, /DATABASE_URL=postgres/);
+    // Normal source file still made it through
+    assert.match(sent, /src\.js/);
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+  }
+});
+
 test("hook redacts sk- key in last_assistant_message before sending", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();
@@ -1581,19 +1625,6 @@ function emitBlock(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }) + "\n");
 }
 
-function gitTrackedDiff(cwd) {
-  try {
-    return execFileSync("git", ["diff", "HEAD", "--no-color"], {
-      cwd,
-      encoding: "utf8",
-      maxBuffer: 4_000_000,
-      stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch {
-    return "";
-  }
-}
-
 function untrackedFiles(cwd) {
   try {
     const out = execFileSync(
@@ -1604,6 +1635,31 @@ function untrackedFiles(cwd) {
     return out.split("\n").map((s) => s.trim()).filter(Boolean);
   } catch {
     return [];
+  }
+}
+
+function trackedChangedFiles(cwd) {
+  try {
+    const out = execFileSync(
+      "git",
+      ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+    return out.split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function trackedDiffForFile(cwd, file) {
+  try {
+    return execFileSync(
+      "git",
+      ["diff", "HEAD", "--no-color", "--", file],
+      { cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch {
+    return "";
   }
 }
 
@@ -1620,26 +1676,28 @@ function syntheticDiffForUntracked(cwd, file) {
   }
 }
 
-function gitDiff(cwd) {
-  const parts = [gitTrackedDiff(cwd)];
+// Per-file iteration so we can filter sensitive paths BEFORE the diff body is generated.
+// Without this, `git diff HEAD` would dump full `.env` contents (and `git diff --no-index`
+// would dump the entire new untracked file body) before redaction had any chance.
+function gitDiff(cwd, extraGlobs = []) {
+  const parts = [];
+  for (const file of trackedChangedFiles(cwd)) {
+    if (shouldSkipFile(file, extraGlobs)) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: sensitive path]`);
+      continue;
+    }
+    const d = trackedDiffForFile(cwd, file);
+    if (d) parts.push(d);
+  }
   for (const file of untrackedFiles(cwd)) {
+    if (shouldSkipFile(file, extraGlobs)) {
+      parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
   return parts.filter(Boolean).join("\n");
-}
-
-function trackedChangedFiles(cwd) {
-  try {
-    const out = execFileSync(
-      "git",
-      ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"],
-      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-    );
-    return out.split("\n").map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
 }
 
 function changedFiles(cwd) {
@@ -1748,7 +1806,7 @@ async function main() {
   }
 
   const lastAssistant = String(input.last_assistant_message ?? "");
-  const diff = gitDiff(workspaceRoot);
+  const diff = gitDiff(workspaceRoot, env.extraGlobs);
   if (!lastAssistant.trim() && !diff.trim()) return;
 
   const truncatedLast = truncate(lastAssistant, LAST_ASSISTANT_HEAD, LAST_ASSISTANT_TAIL);
@@ -1871,20 +1929,28 @@ import { redactSecrets, shouldSkipFile, isBinary } from "./lib/redactor.mjs";
 
 // --- Git helpers (mirror of stop-review-hook.mjs; v0.2 should extract to lib/git.mjs) ---
 
-function gitTrackedDiff(cwd) {
-  try {
-    return execFileSync("git", ["diff", "HEAD", "--no-color"], {
-      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch { return ""; }
-}
-
 function untrackedFiles(cwd) {
   try {
     return execFileSync("git", ["ls-files", "--others", "--exclude-standard"], {
       cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
     }).split("\n").map(s => s.trim()).filter(Boolean);
   } catch { return []; }
+}
+
+function trackedChangedFiles(cwd) {
+  try {
+    return execFileSync("git", ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
+    }).split("\n").map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+function trackedDiffForFile(cwd, file) {
+  try {
+    return execFileSync("git", ["diff", "HEAD", "--no-color", "--", file], {
+      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch { return ""; }
 }
 
 function syntheticDiffForUntracked(cwd, file) {
@@ -1897,21 +1963,25 @@ function syntheticDiffForUntracked(cwd, file) {
   }
 }
 
-function gitDiff(cwd) {
-  const parts = [gitTrackedDiff(cwd)];
+function gitDiff(cwd, extraGlobs = []) {
+  const parts = [];
+  for (const file of trackedChangedFiles(cwd)) {
+    if (shouldSkipFile(file, extraGlobs)) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: sensitive path]`);
+      continue;
+    }
+    const d = trackedDiffForFile(cwd, file);
+    if (d) parts.push(d);
+  }
   for (const file of untrackedFiles(cwd)) {
+    if (shouldSkipFile(file, extraGlobs)) {
+      parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
   return parts.filter(Boolean).join("\n");
-}
-
-function trackedChangedFiles(cwd) {
-  try {
-    return execFileSync("git", ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"], {
-      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
-    }).split("\n").map(s => s.trim()).filter(Boolean);
-  } catch { return []; }
 }
 
 function changedFiles(cwd) {
@@ -2366,7 +2436,7 @@ cd /var/home/mariostjr/Projetos/qwen-review
 node --test test/
 ```
 
-Expected: ~51 tests passed (workspace: 2, config: 6, redactor: 16, prompt: 8, qwen-client: 10, stop-hook: 9 — incluindo o teste de untracked file).
+Expected: ~52 tests passed (workspace: 2, config: 6, redactor: 16, prompt: 8, qwen-client: 10, stop-hook: 10 — incluindo testes de untracked file e untracked-.env-skipped).
 
 - [ ] **Step 2: Smoke install local** (simula instalação real)
 
@@ -2395,12 +2465,19 @@ ln -snf /var/home/mariostjr/Projetos/qwen-review ~/.claude/plugins/local/qwen-re
   4. Expected: gate dispara, Qwen vê o arquivo via diff sintético, retorna BLOCK
   5. `/qwen-review:status` mostra `lastReview.decision: "block"` mencionando `bug.js`
 
-- [ ] **Step 5: Smoke test REDACTION** — cria arquivo com secret modificado deve ser redactado
+- [ ] **Step 5: Smoke test REDACTION (content-level)** — cria arquivo com secret modificado deve ser redactado
   1. Edit: adicione `const apiKey = "sk-abc123def456ghi789jkl012mno345pqr"` num arquivo `.ts`
   2. `QWEN_REVIEW_DEBUG=1` na sessão
   3. Termine o turn
   4. Inspecione `.qwen-review-debug.log` no workspace
   5. Expected: a string `sk-abc123…` foi substituída por `[REDACTED:openai-or-qwen-key]` no prompt enviado
+
+- [ ] **Step 5b: Smoke test FILE-SKIP** — `.env` ou `*.key` novo não vaza
+  1. `QWEN_REVIEW_DEBUG=1` na sessão
+  2. Crie via Write um arquivo `.env.local` com `INTERNAL_PASSWORD=hunter2`
+  3. Termine o turn
+  4. Inspecione `.qwen-review-debug.log`
+  5. Expected: `hunter2` NÃO aparece; o bloco do arquivo aparece como `[diff excluded: sensitive path]` e `[file excluded: sensitive path]`
 
 - [ ] **Step 6: Smoke test FAIL-OPEN** — chave inválida não bloqueia
   1. `QWEN_API_KEY=sk-invalid` na sessão (override)

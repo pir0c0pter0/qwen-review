@@ -79,10 +79,11 @@ hooks.json (Stop, timeout 660s) ──► node scripts/stop-review-hook.mjs
      └─ ok → continua
 5. shortcut: se last_assistant vazio E git diff (tracked+untracked) vazio → exit 0 (ALLOW implícito)
 6. buildPrompt({last_assistant_message, gitDiff(), changedFilesContent()})
-   — `gitDiff()` = `git diff HEAD` + para cada arquivo de `git ls-files --others --exclude-standard`,
-     `git diff --no-index --no-color /dev/null <file>` (diff sintético do "novo")
-   — `changedFilesContent()` itera union de (tracked modificados ∪ untracked criados)
-   — todos os campos textuais passam por redactSecrets() antes da interpolação (ver §5.2)
+   — `gitDiff()` itera per-arquivo (union de tracked modificados + untracked criados),
+     aplica `shouldSkipFile()` ANTES de gerar o diff (sensitive vira placeholder),
+     usa `git diff HEAD -- <file>` para tracked e `git diff --no-index /dev/null <file>` para untracked
+   — `changedFilesContent()` itera mesma union, mesmo skip + redaction
+   — todos os campos textuais passam por redactSecrets() (defesa em camadas) antes da interpolação (ver §5.2)
 7. callQwen(prompt) — `max_tokens`, timeout e `enable_thinking` escolhidos por `QWEN_REVIEW_MODE` (fast|deep, ver §6)
 8. parseDecision(content):
      ├─ /^ALLOW:/ → exit 0
@@ -177,7 +178,7 @@ Evita estourar contexto em turns gigantes; cap total ~12k tokens (margem confort
 
 **Motivação:** o prompt sai do host pro provider HTTP (DashScope, OpenRouter, etc.). Conteúdo de arquivo modificado pode incluir credenciais — `.env` editado, chave hardcoded numa linha próxima ao código real alterado, PEM block num teste. Sem redaction, isso vaza para terceiro.
 
-**File-level skip** — arquivos com estes paths NÃO entram em `CHANGED_FILES_CONTENT` mesmo se modificados; entram só como `=== <path> ===\n[file excluded: sensitive path]\n`:
+**File-level skip** — arquivos com estes paths são excluídos **tanto** de `CHANGED_FILES_CONTENT` **quanto** de `GIT_DIFF` (o hook itera diff per-arquivo justamente para poder filtrar). Em `CHANGED_FILES_CONTENT` entram como `=== <path> ===\n[file excluded: sensitive path]\n`; em `GIT_DIFF` viram `diff --git a/<path> b/<path>\n[diff excluded: sensitive path]\n`. Padrões cobertos:
 
 - `.env*` (`.env`, `.env.local`, `.env.production`, …)
 - `**/*.key`, `**/*.pem`, `**/*.crt`, `**/*.p12`, `**/*.pfx`, `**/*.jks`
@@ -398,3 +399,4 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 - [ ] Token `sk-abc123def456…` em arquivo `.ts` modificado é substituído por `[REDACTED:openai-or-qwen-key]` antes do POST (validado por test que inspeciona o `body` do mock fetch)
 - [ ] PEM block num teste novo é redactado (validado por test)
 - [ ] **Arquivo novo untracked (criado via Write, sem `git add`) dispara review e aparece em `CHANGED_FILES_CONTENT` com diff sintético** (validado por test que cria arquivo + faz hook rodar + checa BLOCK retorna)
+- [ ] **Arquivo `.env` untracked recém-criado NÃO tem conteúdo enviado** (validado por test que cria `.env` com `SECRET=xxx`, captura o body do POST, assert que `SECRET=xxx` não aparece e que `[diff excluded: sensitive path]` aparece)
