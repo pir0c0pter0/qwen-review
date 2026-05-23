@@ -1409,6 +1409,55 @@ test("hook skips API call when assistant message and diff are both empty", () =>
   }
 });
 
+test("hook reviews UNTRACKED new files (not shortcut-skipped, included in prompt)", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    // Create a new file WITHOUT git add — simulates Claude using Write tool
+    fs.writeFileSync(
+      path.join(repo, "broken.js"),
+      "function broken() { return undefiend; }\n"
+    );
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: {
+        cwd: repo,
+        last_assistant_message: "created broken.js",
+        session_id: "s"
+      },
+      mockResponse: {
+        status: 200,
+        body: {
+          choices: [{ message: { content: "BLOCK: typo undefiend in broken.js:1" } }]
+        }
+      }
+    });
+    assert.equal(r.status, 0);
+    const decision = JSON.parse(r.stdout.trim());
+    assert.equal(decision.decision, "block");
+    // Verify the new file content actually reached the prompt
+    const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
+    const sent = JSON.parse(captured.opts.body).messages[0].content;
+    assert.match(sent, /broken\.js/);
+    assert.match(sent, /undefiend/);
+    // Synthetic diff format: "new file mode" header from git diff --no-index
+    assert.match(sent, /new file mode|\+function broken/);
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+  }
+});
+
 test("hook redacts sk- key in last_assistant_message before sending", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();
@@ -1497,7 +1546,7 @@ Path: `/var/home/mariostjr/Projetos/qwen-review/scripts/stop-review-hook.mjs`
 
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -1532,9 +1581,9 @@ function emitBlock(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }) + "\n");
 }
 
-function gitDiff(cwd) {
+function gitTrackedDiff(cwd) {
   try {
-    return execSync("git diff HEAD --no-color", {
+    return execFileSync("git", ["diff", "HEAD", "--no-color"], {
       cwd,
       encoding: "utf8",
       maxBuffer: 4_000_000,
@@ -1545,16 +1594,56 @@ function gitDiff(cwd) {
   }
 }
 
-function changedFiles(cwd) {
+function untrackedFiles(cwd) {
   try {
-    const out = execSync(
-      "git diff HEAD --name-only --diff-filter=ACMRT",
+    const out = execFileSync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard"],
       { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
     );
     return out.split("\n").map((s) => s.trim()).filter(Boolean);
   } catch {
     return [];
   }
+}
+
+function syntheticDiffForUntracked(cwd, file) {
+  // `git diff --no-index` returns exit 1 when files differ; capture stdout from err.
+  try {
+    return execFileSync(
+      "git",
+      ["diff", "--no-index", "--no-color", "/dev/null", file],
+      { cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch (err) {
+    return typeof err.stdout === "string" ? err.stdout : "";
+  }
+}
+
+function gitDiff(cwd) {
+  const parts = [gitTrackedDiff(cwd)];
+  for (const file of untrackedFiles(cwd)) {
+    const d = syntheticDiffForUntracked(cwd, file);
+    if (d) parts.push(d);
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
+function trackedChangedFiles(cwd) {
+  try {
+    const out = execFileSync(
+      "git",
+      ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+    return out.split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function changedFiles(cwd) {
+  return [...trackedChangedFiles(cwd), ...untrackedFiles(cwd)];
 }
 
 function buildChangedFilesContent(cwd, { redactEnabled, extraGlobs, maxFiles }) {
@@ -1771,7 +1860,7 @@ Path: `/var/home/mariostjr/Projetos/qwen-review/scripts/qwen-review.mjs`
 
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -1779,6 +1868,55 @@ import { loadState, getConfig, setConfig } from "./lib/config.mjs";
 import { callQwen } from "./lib/qwen-client.mjs";
 import { loadTemplate, interpolate, truncate } from "./lib/prompt.mjs";
 import { redactSecrets, shouldSkipFile, isBinary } from "./lib/redactor.mjs";
+
+// --- Git helpers (mirror of stop-review-hook.mjs; v0.2 should extract to lib/git.mjs) ---
+
+function gitTrackedDiff(cwd) {
+  try {
+    return execFileSync("git", ["diff", "HEAD", "--no-color"], {
+      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch { return ""; }
+}
+
+function untrackedFiles(cwd) {
+  try {
+    return execFileSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
+    }).split("\n").map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+function syntheticDiffForUntracked(cwd, file) {
+  try {
+    return execFileSync("git", ["diff", "--no-index", "--no-color", "/dev/null", file], {
+      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch (err) {
+    return typeof err.stdout === "string" ? err.stdout : "";
+  }
+}
+
+function gitDiff(cwd) {
+  const parts = [gitTrackedDiff(cwd)];
+  for (const file of untrackedFiles(cwd)) {
+    const d = syntheticDiffForUntracked(cwd, file);
+    if (d) parts.push(d);
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
+function trackedChangedFiles(cwd) {
+  try {
+    return execFileSync("git", ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
+    }).split("\n").map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+function changedFiles(cwd) {
+  return [...trackedChangedFiles(cwd), ...untrackedFiles(cwd)];
+}
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
@@ -1867,17 +2005,8 @@ function cmdStatus() {
 }
 
 function buildCheckPrompt({ cwd, diffOnly, env }) {
-  const diff = (() => {
-    try {
-      return execSync("git diff HEAD --no-color", { cwd, encoding: "utf8", maxBuffer: 4_000_000 });
-    } catch { return ""; }
-  })();
-  const files = (() => {
-    try {
-      return execSync("git diff HEAD --name-only --diff-filter=ACMRT", { cwd, encoding: "utf8" })
-        .split("\n").map(s => s.trim()).filter(Boolean);
-    } catch { return []; }
-  })();
+  const diff = gitDiff(cwd);           // includes untracked synthetic diffs
+  const files = changedFiles(cwd);     // tracked-modified ∪ untracked-new
 
   const blocks = [];
   for (const file of files.slice(0, 5)) {
@@ -2237,7 +2366,7 @@ cd /var/home/mariostjr/Projetos/qwen-review
 node --test test/
 ```
 
-Expected: ~50 tests passed (workspace: 2, config: 6, redactor: 16, prompt: 8, qwen-client: 10, stop-hook: 8).
+Expected: ~51 tests passed (workspace: 2, config: 6, redactor: 16, prompt: 8, qwen-client: 10, stop-hook: 9 — incluindo o teste de untracked file).
 
 - [ ] **Step 2: Smoke install local** (simula instalação real)
 
@@ -2258,6 +2387,13 @@ ln -snf /var/home/mariostjr/Projetos/qwen-review ~/.claude/plugins/local/qwen-re
   2. Termine o turn
   3. Expected: stderr/transcript mostra "Qwen review found issues: …", Claude continua o turn pra corrigir
   4. `/qwen-review:status` mostra `lastReview.decision: "block"` com a razão
+
+- [ ] **Step 4b: Smoke test UNTRACKED NEW FILE** — arquivo novo (sem `git add`) também é revisado
+  1. Em outro turn, peça pro Claude criar um arquivo `bug.js` novo (via Write tool) com `function f() { return null.foo; }`
+  2. NÃO faça `git add`
+  3. Termine o turn
+  4. Expected: gate dispara, Qwen vê o arquivo via diff sintético, retorna BLOCK
+  5. `/qwen-review:status` mostra `lastReview.decision: "block"` mencionando `bug.js`
 
 - [ ] **Step 5: Smoke test REDACTION** — cria arquivo com secret modificado deve ser redactado
   1. Edit: adicione `const apiKey = "sk-abc123def456ghi789jkl012mno345pqr"` num arquivo `.ts`
@@ -2322,6 +2458,7 @@ git push origin v0.1.0
 **Conhecidos:**
 - Test usando `Response` global precisa de Node ≥ 18 — pre-flight checa
 - Mock fetch via `--import` preload depende de Node ≥ 20 (em 18.x o flag é `--experimental-loader`). Se ambiente for 18.x, ajustar para `node --experimental-loader` no comando `runHook`.
+- Helpers de git (`gitTrackedDiff`, `untrackedFiles`, `syntheticDiffForUntracked`, `gitDiff`, `trackedChangedFiles`, `changedFiles`) estão duplicados entre `scripts/stop-review-hook.mjs` e `scripts/qwen-review.mjs`. v0.2 deve extrair pra `scripts/lib/git.mjs` (anotado como TODO no header da seção do Task 7).
 
 ## Execution Handoff
 

@@ -23,7 +23,7 @@ Comportamento espelha o `stop-review-gate` do plugin codex (`/home/mariostjr/.cl
 | Credenciais | Env vars: `QWEN_API_KEY` (obrigatório), `QWEN_BASE_URL`, `QWEN_MODEL` |
 | Comportamento do gate | `decision: "block"` quando Qwen devolve `BLOCK:` |
 | Política de erro | Fail-open: qualquer falha de rede / 5xx / timeout / parse libera o stop |
-| Escopo do review | `last_assistant_message` + `git diff HEAD` + conteúdo integral dos arquivos modificados (capado, com pre-redaction de secrets) |
+| Escopo do review | `last_assistant_message` + `git diff HEAD` **+ diff sintético de arquivos untracked** (`git ls-files --others --exclude-standard`) + conteúdo integral dos arquivos modificados/criados (capado, com pre-redaction de secrets) |
 | Modos de inferência | `fast` (default): sem thinking, `max_tokens: 1024`, timeout 120s, latência 3-15s. `deep`: `enable_thinking=true`, `max_tokens: 8192`, timeout 600s, latência 60-180s. `temperature: 0.2` em ambos. |
 | Linguagem | Node ≥18, zero dependências npm (usa `fetch` nativo) |
 
@@ -77,8 +77,11 @@ hooks.json (Stop, timeout 660s) ──► node scripts/stop-review-hook.mjs
 4. validateEnv()
      ├─ QWEN_API_KEY ausente → log stderr + exit 0 (fail-open)
      └─ ok → continua
-5. shortcut: se last_assistant vazio E git diff vazio → exit 0 (ALLOW implícito)
+5. shortcut: se last_assistant vazio E git diff (tracked+untracked) vazio → exit 0 (ALLOW implícito)
 6. buildPrompt({last_assistant_message, gitDiff(), changedFilesContent()})
+   — `gitDiff()` = `git diff HEAD` + para cada arquivo de `git ls-files --others --exclude-standard`,
+     `git diff --no-index --no-color /dev/null <file>` (diff sintético do "novo")
+   — `changedFilesContent()` itera union de (tracked modificados ∪ untracked criados)
    — todos os campos textuais passam por redactSecrets() antes da interpolação (ver §5.2)
 7. callQwen(prompt) — `max_tokens`, timeout e `enable_thinking` escolhidos por `QWEN_REVIEW_MODE` (fast|deep, ver §6)
 8. parseDecision(content):
@@ -394,3 +397,4 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 - [ ] Secret em arquivo `.env` modificado NÃO é enviado ao Qwen (file-level skip; bloco aparece como `[file excluded: sensitive path]`)
 - [ ] Token `sk-abc123def456…` em arquivo `.ts` modificado é substituído por `[REDACTED:openai-or-qwen-key]` antes do POST (validado por test que inspeciona o `body` do mock fetch)
 - [ ] PEM block num teste novo é redactado (validado por test)
+- [ ] **Arquivo novo untracked (criado via Write, sem `git add`) dispara review e aparece em `CHANGED_FILES_CONTENT` com diff sintético** (validado por test que cria arquivo + faz hook rodar + checa BLOCK retorna)
