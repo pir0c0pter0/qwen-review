@@ -23,8 +23,8 @@ Comportamento espelha o `stop-review-gate` do plugin codex (`/home/mariostjr/.cl
 | Credenciais | Env vars: `QWEN_API_KEY` (obrigatório), `QWEN_BASE_URL`, `QWEN_MODEL` |
 | Comportamento do gate | `decision: "block"` quando Qwen devolve `BLOCK:` |
 | Política de erro | Fail-open: qualquer falha de rede / 5xx / timeout / parse libera o stop |
-| Escopo do review | `last_assistant_message` + `git diff HEAD` + conteúdo integral dos arquivos modificados (capado) |
-| Modo de inferência | Sem thinking, `temperature: 0.2`, `max_tokens: 1024`, timeout HTTP 120s |
+| Escopo do review | `last_assistant_message` + `git diff HEAD` + conteúdo integral dos arquivos modificados (capado, com pre-redaction de secrets) |
+| Modos de inferência | `fast` (default): sem thinking, `max_tokens: 1024`, timeout 120s, latência 3-15s. `deep`: `enable_thinking=true`, `max_tokens: 8192`, timeout 600s, latência 60-180s. `temperature: 0.2` em ambos. |
 | Linguagem | Node ≥18, zero dependências npm (usa `fetch` nativo) |
 
 ## 3. Layout do plugin
@@ -34,7 +34,7 @@ Comportamento espelha o `stop-review-gate` do plugin codex (`/home/mariostjr/.cl
 ├── .claude-plugin/
 │   └── plugin.json              # name: qwen-review, version: 0.1.0
 ├── hooks/
-│   └── hooks.json               # registra Stop hook → stop-review-hook.mjs (timeout 180s)
+│   └── hooks.json               # registra Stop hook → stop-review-hook.mjs (timeout 660s)
 ├── commands/
 │   ├── setup.md                 # /qwen-review:setup [--enable|--disable]
 │   ├── status.md                # /qwen-review:status
@@ -66,7 +66,7 @@ State por workspace fica em `${CLAUDE_PLUGIN_DATA}/state/<slug>-<hash16>/state.j
 Claude Code termina turn
         │
         ▼
-hooks.json (Stop, timeout 180s) ──► node scripts/stop-review-hook.mjs
+hooks.json (Stop, timeout 660s) ──► node scripts/stop-review-hook.mjs
         │
         ▼
 1. lê stdin JSON: {cwd, session_id, last_assistant_message, transcript_path, hook_event_name}
@@ -79,7 +79,8 @@ hooks.json (Stop, timeout 180s) ──► node scripts/stop-review-hook.mjs
      └─ ok → continua
 5. shortcut: se last_assistant vazio E git diff vazio → exit 0 (ALLOW implícito)
 6. buildPrompt({last_assistant_message, gitDiff(), changedFilesContent()})
-7. callQwen(prompt) com AbortController(120_000ms)
+   — todos os campos textuais passam por redactSecrets() antes da interpolação (ver §5.2)
+7. callQwen(prompt) — `max_tokens`, timeout e `enable_thinking` escolhidos por `QWEN_REVIEW_MODE` (fast|deep, ver §6)
 8. parseDecision(content):
      ├─ /^ALLOW:/ → exit 0
      ├─ /^BLOCK:/ → emit {decision:"block", reason:"Qwen review found issues: <texto>"}
@@ -165,16 +166,63 @@ Nada antes dessa linha. Não use markdown na primeira linha.
 | `GIT_DIFF` | head 12000 + `[diff truncated]` (sem tail) |
 | `CHANGED_FILES_CONTENT` | até 5 arquivos, 4000 chars/arquivo, total cap 16000 |
 
-`changedFilesContent()` lista arquivos do diff (excluindo deletados), lê cada um, prefixa com `=== path/to/file ===\n`, trunca por arquivo. Se exceder 5 arquivos ou 16000 chars totais, anexa `\n[N arquivos adicionais omitidos]`.
+`changedFilesContent()` lista arquivos do diff (excluindo deletados), aplica file-level skip (§5.2), lê o restante, prefixa com `=== path/to/file ===\n`, redact + trunca por arquivo. Se exceder 5 arquivos ou 16000 chars totais, anexa `\n[N arquivos adicionais omitidos]`.
 
 Evita estourar contexto em turns gigantes; cap total ~12k tokens (margem confortável dentro do limite do qwen3-max).
+
+### 5.2 Redaction de secrets (pre-send, obrigatória por default)
+
+**Motivação:** o prompt sai do host pro provider HTTP (DashScope, OpenRouter, etc.). Conteúdo de arquivo modificado pode incluir credenciais — `.env` editado, chave hardcoded numa linha próxima ao código real alterado, PEM block num teste. Sem redaction, isso vaza para terceiro.
+
+**File-level skip** — arquivos com estes paths NÃO entram em `CHANGED_FILES_CONTENT` mesmo se modificados; entram só como `=== <path> ===\n[file excluded: sensitive path]\n`:
+
+- `.env*` (`.env`, `.env.local`, `.env.production`, …)
+- `**/*.key`, `**/*.pem`, `**/*.crt`, `**/*.p12`, `**/*.pfx`, `**/*.jks`
+- `**/id_rsa*`, `**/id_ed25519*`, `**/id_ecdsa*`
+- Paths contendo `secret`, `credential`, `token` (case-insensitive)
+- Binários (detectados por byte `0x00` nos primeiros 8KB lidos)
+
+**Content-level redaction** — regex aplicadas em `LAST_ASSISTANT`, `GIT_DIFF` e `CHANGED_FILES_CONTENT`:
+
+| Padrão | Substitui por |
+|---|---|
+| `AKIA[0-9A-Z]{16}` | `[REDACTED:aws-access-key]` |
+| `sk-[A-Za-z0-9_-]{20,}` | `[REDACTED:openai-or-qwen-key]` |
+| `gh[pousr]_[A-Za-z0-9]{20,}` | `[REDACTED:github-token]` |
+| `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}` | `[REDACTED:jwt]` |
+| `-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----` | `[REDACTED:pem]` |
+| `xox[baprs]-[A-Za-z0-9-]{10,}` | `[REDACTED:slack-token]` |
+
+Diff também é redactado: arquivo modificado pode estar *adicionando* secret na linha `+`.
+
+**Controle do usuário:**
+- `QWEN_REVIEW_REDACT_SECRETS=0` desativa redaction (opt-out, **NÃO recomendado**)
+- `QWEN_REVIEW_EXCLUDE_GLOBS=glob1:glob2` adiciona globs à lista de skip
+
+**Defesa em camadas:** o prompt ainda instrui Qwen a não ecoar literais que pareçam secret, redundante com a redaction (proteção contra padrão novo que escape do regex).
 
 ## 6. Cliente HTTP (`lib/qwen-client.mjs`)
 
 ```javascript
-export async function callQwen({ apiKey, baseUrl, model, prompt, timeoutMs }) {
+const MODE_DEFAULTS = {
+  fast: { maxTokens: 1024, timeoutMs: 120_000, enableThinking: false },
+  deep: { maxTokens: 8192, timeoutMs: 600_000, enableThinking: true }
+};
+
+export async function callQwen({ apiKey, baseUrl, model, prompt, mode = "fast", overrides = {} }) {
+  const params = { ...MODE_DEFAULTS[mode], ...overrides };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+  const body = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    max_tokens: params.maxTokens,
+    stream: false
+  };
+  if (params.enableThinking) {
+    body.extra_body = { enable_thinking: true };
+  }
   try {
     const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
@@ -182,18 +230,12 @@ export async function callQwen({ apiKey, baseUrl, model, prompt, timeoutMs }) {
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-        max_tokens: 1024,
-        stream: false
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`Qwen API ${res.status}: ${body.slice(0, 300)}`);
+      const errBody = await res.text().catch(() => "");
+      throw new Error(`Qwen API ${res.status}: ${errBody.slice(0, 300)}`);
     }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content ?? "";
@@ -206,6 +248,19 @@ export async function callQwen({ apiKey, baseUrl, model, prompt, timeoutMs }) {
 ```
 
 Compatível com qualquer endpoint OpenAI-compat (DashScope, OpenRouter, vLLM local, etc.) — só muda `QWEN_BASE_URL`.
+
+### 6.1 Modos `fast` vs `deep`
+
+`QWEN_REVIEW_MODE` controla o trade-off entre latência e profundidade:
+
+| Modo | `max_tokens` | timeout HTTP | `enable_thinking` | Latência típica | Quando usar |
+|---|---|---|---|---|---|
+| `fast` (default) | 1024 | 120s | omitido (false) | 3-15s | Edits rotineiros — bug fix simples, refactor pequeno, doc |
+| `deep` | 8192 | 600s | `true` | 60-180s | Edits sensíveis — segurança, lógica de billing, migrações de schema, mudanças em código de auth |
+
+`deep` ativa o reasoning interno do qwen3-max — review mais profundo (cobre invariantes implícitas, casos extremos), mas custa ~10× mais tokens de saída e pode atrasar o stop em até 3 minutos. Hook timeout vai pra 660s (600s API + 60s margem) quando `mode=deep`.
+
+`QWEN_REVIEW_MAX_TOKENS` e `QWEN_REVIEW_TIMEOUT_MS` continuam funcionando como overrides finos sobre o default do modo escolhido.
 
 ## 7. Comandos `/qwen-review:*`
 
@@ -262,6 +317,7 @@ test/
 ├── parse-decision.test.mjs   ALLOW:, BLOCK:, vazio, prefixo invariante, case-sensitivity
 ├── prompt.test.mjs           interpolação {{VAR}}, truncamento head/tail, variável faltando
 ├── config.test.mjs           read/write state.json, isolamento entre slugs, migração v0→v1
+├── redactor.test.mjs         AKIA/sk-/ghp_/JWT/PEM/Slack matching; .env/.key/binary file skip; EXCLUDE_GLOBS user-defined
 ├── stop-hook.test.mjs        mock global.fetch — gate off, no key, BLOCK, ALLOW, timeout, 5xx, parse inválido, diff vazio
 └── qwen-client.test.mjs      mock fetch — auth header presente, AbortController dispara em timeout, erro 4xx propaga body
 ```
@@ -277,11 +333,12 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 
 ## 10. Segurança
 
+- **Pre-redaction obrigatória por default** (§5.2): file-level skip de paths sensíveis (`.env*`, `*.key`, `*.pem`, paths com `secret`/`credential`/`token`, binários) + content-level regex que mascara AWS/OpenAI/GitHub/Slack tokens, JWTs e PEM blocks ANTES da interpolação no prompt. Aplicado também ao `GIT_DIFF` (não só ao file content).
+- Defense in depth: prompt instrui Qwen a não ecoar secrets (redundante com a redaction; cobre padrão novo que escape do regex)
 - `QWEN_API_KEY` nunca logada inteira; só sufixo (`sk-•••cde`)
-- Prompt tem regra explícita anti-eco de strings que pareçam secret
 - Sem `shell: true` em nenhum spawn; sempre array de args
 - `git diff` é chamado com `--no-color` explícito (defensivo, mesmo sendo o default)
-- Timeout duro de 120s na chamada HTTP, 180s no hook inteiro (margem para parse/disk)
+- Timeout duro: HTTP 120s (fast) / 600s (deep); hook 660s no total (cobre worst case deep + margem)
 - State files com permissão `0o600` (mesma que o codex usa)
 
 ## 11. Variáveis de ambiente
@@ -291,9 +348,12 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 | `QWEN_API_KEY` | sim | — | Sem ela, gate auto-skip com aviso |
 | `QWEN_BASE_URL` | não | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | OpenAI-compat endpoint |
 | `QWEN_MODEL` | não | `qwen3-max` | Override para `qwen-max-latest`, `qwen/qwen3-max` (OpenRouter), etc. |
-| `QWEN_REVIEW_TIMEOUT_MS` | não | `120000` | Timeout da chamada HTTP |
-| `QWEN_REVIEW_MAX_TOKENS` | não | `1024` | Cap de saída do modelo |
+| `QWEN_REVIEW_MODE` | não | `fast` | `fast` (sem thinking, 1024 tok, 120s) ou `deep` (thinking, 8192 tok, 600s). Ver §6.1 |
+| `QWEN_REVIEW_TIMEOUT_MS` | não | `120000` (fast) / `600000` (deep) | Override do timeout HTTP |
+| `QWEN_REVIEW_MAX_TOKENS` | não | `1024` (fast) / `8192` (deep) | Override do cap de saída |
 | `QWEN_REVIEW_MAX_FILES` | não | `5` | Quantos arquivos enviar em `CHANGED_FILES_CONTENT` |
+| `QWEN_REVIEW_REDACT_SECRETS` | não | `1` | `0` desliga redaction de secrets (NÃO recomendado) |
+| `QWEN_REVIEW_EXCLUDE_GLOBS` | não | — | Globs extras pra skip de file content, separados por `:` |
 | `QWEN_REVIEW_DEBUG` | não | `0` | `1` ativa log no workspace |
 
 ## 12. Não-objetivos (YAGNI)
@@ -331,3 +391,6 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 - [ ] Timeout, 5xx, JSON inválido → fail-open com mensagem clara no stderr
 - [ ] `/qwen-review:status` mostra último review e config
 - [ ] `node --test test/` passa 100%
+- [ ] Secret em arquivo `.env` modificado NÃO é enviado ao Qwen (file-level skip; bloco aparece como `[file excluded: sensitive path]`)
+- [ ] Token `sk-abc123def456…` em arquivo `.ts` modificado é substituído por `[REDACTED:openai-or-qwen-key]` antes do POST (validado por test que inspeciona o `body` do mock fetch)
+- [ ] PEM block num teste novo é redactado (validado por test)
