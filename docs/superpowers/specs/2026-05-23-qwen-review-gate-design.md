@@ -23,7 +23,7 @@ Comportamento espelha o `stop-review-gate` do plugin codex (`/home/mariostjr/.cl
 | Credenciais | Env vars: `QWEN_API_KEY` (obrigatório), `QWEN_BASE_URL`, `QWEN_MODEL` |
 | Comportamento do gate | `decision: "block"` quando Qwen devolve `BLOCK:` |
 | Política de erro | Fail-open: qualquer falha de rede / 5xx / timeout / parse libera o stop |
-| Escopo do review | `last_assistant_message` + `git diff HEAD` (staged + unstaged) |
+| Escopo do review | `last_assistant_message` + `git diff HEAD` + conteúdo integral dos arquivos modificados (capado) |
 | Modo de inferência | Sem thinking, `temperature: 0.2`, `max_tokens: 1024`, timeout HTTP 120s |
 | Linguagem | Node ≥18, zero dependências npm (usa `fetch` nativo) |
 
@@ -78,7 +78,7 @@ hooks.json (Stop, timeout 180s) ──► node scripts/stop-review-hook.mjs
      ├─ QWEN_API_KEY ausente → log stderr + exit 0 (fail-open)
      └─ ok → continua
 5. shortcut: se last_assistant vazio E git diff vazio → exit 0 (ALLOW implícito)
-6. buildPrompt({last_assistant_message, gitDiff()})
+6. buildPrompt({last_assistant_message, gitDiff(), changedFilesContent()})
 7. callQwen(prompt) com AbortController(120_000ms)
 8. parseDecision(content):
      ├─ /^ALLOW:/ → exit 0
@@ -134,6 +134,10 @@ Não bloqueie por edits de turns anteriores; só pelo que mudou agora.
 {{GIT_DIFF}}
 </git_diff_head>
 
+<changed_files_content>
+{{CHANGED_FILES_CONTENT}}
+</changed_files_content>
+
 <output_contract>
 Sua primeira linha DEVE ser exatamente:
 - ALLOW: <razão curta>
@@ -146,6 +150,8 @@ Nada antes dessa linha. Não use markdown na primeira linha.
 - BLOCK se: bug claro, regressão, segurança (injection/secrets/auth quebrada), API quebrada,
   teste falhando que deveria passar, lógica contradiz o que o assistente afirmou na resposta.
 - Cite arquivo:linha quando for BLOCK.
+- Use `<changed_files_content>` para entender contexto além do diff (callers, tipos, invariantes
+  declaradas mais acima no arquivo). Diff sem o arquivo cheio gera falso positivo.
 - Não invente: se o diff está vazio e o turno é status/setup → ALLOW.
 - Nunca eco literais que pareçam secret (AKIA…, sk-…, eyJ…, ghp_…).
 </rules>
@@ -153,10 +159,15 @@ Nada antes dessa linha. Não use markdown na primeira linha.
 
 ### 5.1 Truncamento
 
-- `LAST_ASSISTANT`: head 4000 chars + `\n[…truncated…]\n` + tail 4000 chars (total ~8000)
-- `GIT_DIFF`: head 12000 chars + `\n[diff truncated]\n` (sem tail, só head — primeira mudança costuma ser a mais informativa)
+| Variável | Budget |
+|---|---|
+| `LAST_ASSISTANT` | head 4000 + `[…truncated…]` + tail 4000 (~8000 chars) |
+| `GIT_DIFF` | head 12000 + `[diff truncated]` (sem tail) |
+| `CHANGED_FILES_CONTENT` | até 5 arquivos, 4000 chars/arquivo, total cap 16000 |
 
-Evita estourar contexto em turns gigantes e cap em `~25k tokens` de prompt no pior caso.
+`changedFilesContent()` lista arquivos do diff (excluindo deletados), lê cada um, prefixa com `=== path/to/file ===\n`, trunca por arquivo. Se exceder 5 arquivos ou 16000 chars totais, anexa `\n[N arquivos adicionais omitidos]`.
+
+Evita estourar contexto em turns gigantes; cap total ~12k tokens (margem confortável dentro do limite do qwen3-max).
 
 ## 6. Cliente HTTP (`lib/qwen-client.mjs`)
 
@@ -282,6 +293,7 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 | `QWEN_MODEL` | não | `qwen3-max` | Override para `qwen-max-latest`, `qwen/qwen3-max` (OpenRouter), etc. |
 | `QWEN_REVIEW_TIMEOUT_MS` | não | `120000` | Timeout da chamada HTTP |
 | `QWEN_REVIEW_MAX_TOKENS` | não | `1024` | Cap de saída do modelo |
+| `QWEN_REVIEW_MAX_FILES` | não | `5` | Quantos arquivos enviar em `CHANGED_FILES_CONTENT` |
 | `QWEN_REVIEW_DEBUG` | não | `0` | `1` ativa log no workspace |
 
 ## 12. Não-objetivos (YAGNI)
@@ -294,6 +306,8 @@ Cobertura mínima: cada linha do switch de decisão em `stop-review-hook.mjs` ex
 - ❌ UI / TUI (output puro JSON ou texto via comandos)
 - ❌ Telemetria externa
 - ❌ Integração com `superpowers:code-review` (escopo separado)
+- ❌ Tool calling / function calling para Qwen buscar callers via grep (v0.2; v0.1 só pré-injeta arquivos completos)
+- ❌ Injeção automática de `CLAUDE.md` / convenções (avaliar em v0.2 se BLOCKs falsos por estilo aparecerem)
 
 ## 13. Roadmap de implementação (resumido — detalhe vai no plano)
 
