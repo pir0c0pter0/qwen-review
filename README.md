@@ -80,7 +80,7 @@ Ver `docs/superpowers/specs/2026-05-23-qwen-review-gate-design.md` §5.2 e §10.
 ## Desenvolvimento
 
 ```bash
-node --test test/    # roda todos os testes
+node --test test/*.test.mjs    # roda todos os testes
 node scripts/qwen-review.mjs status    # sanity check sem rede
 ```
 

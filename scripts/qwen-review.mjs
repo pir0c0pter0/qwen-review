@@ -160,13 +160,13 @@ function cmdStatus() {
   process.stdout.write(JSON.stringify(output, null, 2) + "\n");
 }
 
-function buildCheckPrompt({ cwd, diffOnly }) {
-  const diff = gitDiff(cwd);
+function buildCheckPrompt({ cwd, diffOnly, extraGlobs = [] }) {
+  const diff = gitDiff(cwd, extraGlobs);
   const files = changedFiles(cwd);
 
   const blocks = [];
   for (const file of files.slice(0, 5)) {
-    if (shouldSkipFile(file)) { blocks.push(`=== ${file} ===\n[file excluded: sensitive path]`); continue; }
+    if (shouldSkipFile(file, extraGlobs)) { blocks.push(`=== ${file} ===\n[file excluded: sensitive path]`); continue; }
     let buf;
     try { buf = fs.readFileSync(path.join(cwd, file)); } catch { continue; }
     if (isBinary(buf)) { blocks.push(`=== ${file} ===\n[file excluded: binary]`); continue; }
@@ -192,7 +192,10 @@ async function cmdCheck(args) {
   }
   const cwd = resolveWorkspaceRoot(process.cwd());
   const diffOnly = args.includes("--diff-only");
-  const prompt = buildCheckPrompt({ cwd, diffOnly });
+  const extraGlobs = (process.env.QWEN_REVIEW_EXCLUDE_GLOBS || "")
+    .split(":")
+    .filter(Boolean);
+  const prompt = buildCheckPrompt({ cwd, diffOnly, extraGlobs });
   const result = await callQwen({
     apiKey: env.apiKey,
     baseUrl: env.baseUrl,
