@@ -89,7 +89,7 @@ Path: `/var/home/mariostjr/Projetos/qwen-review/.claude-plugin/plugin.json`
   "version": "0.1.0",
   "description": "Stop-time review gate via Qwen 3.7 Max API (OpenAI-compatible). Espelha o codex stop-review-gate.",
   "author": {
-    "name": "Mario Junior"
+    "name": "Pir0c0pter0"
   }
 }
 ```

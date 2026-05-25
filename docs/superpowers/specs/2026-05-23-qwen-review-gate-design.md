@@ -2,7 +2,7 @@
 
 **Status:** design aprovado, aguardando review do usuário antes do plano de implementação.
 **Data:** 2026-05-23
-**Autor:** Claude (Opus 4.7) + Mario
+**Autor:** Claude (Opus 4.7) + Pir0c0pter0
 **Inspiração:** plugin `openai-codex` (estrutura de hooks/commands/state/scripts)
 
 ---
