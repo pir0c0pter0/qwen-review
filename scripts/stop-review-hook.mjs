@@ -272,6 +272,11 @@ async function main() {
     return;
   }
 
+  // Per-workspace mode override beats QWEN_REVIEW_MODE env
+  if (cfg.mode === "fast" || cfg.mode === "thinking") {
+    env.mode = cfg.mode;
+  }
+
   const lastAssistant = String(input.last_assistant_message ?? "");
   const diff = gitDiff(workspaceRoot, env.extraGlobs);
   if (!lastAssistant.trim() && !diff.trim()) return;

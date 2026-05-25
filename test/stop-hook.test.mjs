@@ -372,6 +372,41 @@ test("tracked hardlinks do NOT leak via git diff", () => {
   }
 });
 
+test("per-workspace mode override (state.config.mode) beats env QWEN_REVIEW_MODE", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  try {
+    // Set gate ON + mode=thinking in workspace state
+    execSync(
+      `node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(async m => { m.setConfig('${repo}', 'stopReviewGate', true); m.setConfig('${repo}', 'mode', 'thinking'); })"`,
+      { env: { ...process.env, CLAUDE_PLUGIN_DATA: data } }
+    );
+    fs.writeFileSync(path.join(repo, "src.js"), "export const x = 1;\n");
+    execSync("git add src.js", { cwd: repo });
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        QWEN_REVIEW_MODE: "fast",  // env says fast, but workspace state says thinking
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "edit", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    const body = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body);
+    // thinking mode sends extra_body.enable_thinking=true and max_tokens=8192
+    assert.equal(body.max_tokens, 8192, "workspace mode 'thinking' should override env 'fast'");
+    assert.deepEqual(body.extra_body, { enable_thinking: true });
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+  }
+});
+
 test("hook never reads through hardlinks (target may be outside repo)", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();

@@ -138,12 +138,29 @@ async function pingQwen(env) {
   }
 }
 
+function parseModeArg(args) {
+  // Accepts: --mode=fast | --mode=thinking | --mode=deep
+  //          --fast | --thinking
+  for (const a of args) {
+    if (a === "--fast") return "fast";
+    if (a === "--thinking" || a === "--deep") return "thinking";
+    if (a.startsWith("--mode=")) {
+      const v = a.slice("--mode=".length).toLowerCase();
+      if (v === "fast") return "fast";
+      if (v === "thinking" || v === "deep") return "thinking";
+      return null; // invalid value
+    }
+  }
+  return undefined; // not specified
+}
+
 async function cmdSetup(args) {
   const workspaceRoot = resolveWorkspaceRoot(process.cwd());
   const env = readEnv();
   const actions = [];
 
-  let nextGate = getConfig(workspaceRoot).stopReviewGate;
+  const currentConfig = getConfig(workspaceRoot);
+  let nextGate = currentConfig.stopReviewGate;
   if (args.includes("--enable")) {
     setConfig(workspaceRoot, "stopReviewGate", true);
     nextGate = true;
@@ -152,6 +169,19 @@ async function cmdSetup(args) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     nextGate = false;
     actions.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  // Per-workspace mode override (separate from global QWEN_REVIEW_MODE env)
+  const requestedMode = parseModeArg(args);
+  if (requestedMode === null) {
+    process.stderr.write("qwen-review: invalid --mode value (use fast or thinking)\n");
+    process.exit(2);
+  }
+  let effectiveMode = currentConfig.mode || env.mode;
+  if (requestedMode) {
+    setConfig(workspaceRoot, "mode", requestedMode);
+    effectiveMode = requestedMode;
+    actions.push(`Set workspace mode to '${requestedMode}'.`);
   }
 
   const envOk = !!env.apiKey;
@@ -163,7 +193,8 @@ async function cmdSetup(args) {
     apiKey: maskKey(env.apiKey),
     baseUrl: env.baseUrl,
     model: env.model,
-    mode: env.mode,
+    mode: effectiveMode,
+    modeSource: currentConfig.mode || requestedMode ? "workspace" : "env",
     reviewGateEnabled: nextGate,
     ping,
     actionsTaken: actions
