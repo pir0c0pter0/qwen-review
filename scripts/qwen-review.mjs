@@ -177,12 +177,16 @@ async function cmdSetup(args) {
     process.stderr.write("qwen-review: invalid --mode value (use fast or thinking)\n");
     process.exit(2);
   }
-  let effectiveMode = currentConfig.mode || env.mode;
   if (requestedMode) {
     setConfig(workspaceRoot, "mode", requestedMode);
-    effectiveMode = requestedMode;
     actions.push(`Set workspace mode to '${requestedMode}'.`);
   }
+
+  // Reload config after possible setConfig so we resolve from current state
+  const resolved = resolveEffectiveMode(
+    requestedMode ? { ...currentConfig, mode: requestedMode } : currentConfig,
+    env.mode
+  );
 
   const envOk = !!env.apiKey;
   const ping = envOk ? await pingQwen(env) : { ok: false, error: "QWEN_API_KEY not set" };
@@ -193,8 +197,8 @@ async function cmdSetup(args) {
     apiKey: maskKey(env.apiKey),
     baseUrl: env.baseUrl,
     model: env.model,
-    mode: effectiveMode,
-    modeSource: currentConfig.mode || requestedMode ? "workspace" : "env",
+    mode: resolved.mode,
+    modeSource: resolved.source,
     reviewGateEnabled: nextGate,
     ping,
     actionsTaken: actions
@@ -202,17 +206,27 @@ async function cmdSetup(args) {
   process.stdout.write(JSON.stringify(output, null, 2) + "\n");
 }
 
+function resolveEffectiveMode(workspaceConfig, envMode) {
+  // Workspace state.config.mode beats env QWEN_REVIEW_MODE.
+  if (workspaceConfig.mode === "fast" || workspaceConfig.mode === "thinking") {
+    return { mode: workspaceConfig.mode, source: "workspace" };
+  }
+  return { mode: envMode, source: "env" };
+}
+
 function cmdStatus() {
   const workspaceRoot = resolveWorkspaceRoot(process.cwd());
   const env = readEnv();
   const state = loadState(workspaceRoot);
+  const resolved = resolveEffectiveMode(state.config, env.mode);
   const output = {
     workspaceRoot,
     envOk: !!env.apiKey,
     apiKey: maskKey(env.apiKey),
     baseUrl: env.baseUrl,
     model: env.model,
-    mode: env.mode,
+    mode: resolved.mode,
+    modeSource: resolved.source,
     reviewGateEnabled: state.config.stopReviewGate,
     lastReview: state.lastReview
   };
