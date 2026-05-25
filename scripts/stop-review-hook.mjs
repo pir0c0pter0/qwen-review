@@ -112,6 +112,14 @@ function gitDiff(cwd, extraGlobs = []) {
       parts.push(`diff --git a/${file} b/${file}\nnew symlink\n[diff excluded: symlink target may be outside repo]`);
       continue;
     }
+    if (!stat.isFile()) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: not a regular file]`);
+      continue;
+    }
+    if (stat.nlink > 1) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: hardlink may point outside repo]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
@@ -151,6 +159,19 @@ function buildChangedFilesContent(cwd, { redactEnabled, extraGlobs, maxFiles }) 
       // Never read through a symlink — target may be outside the repo
       // (e.g., ~/.aws/credentials, /etc/shadow, dotfiles repos).
       blocks.push(`=== ${file} ===\n[file excluded: symlink]`);
+      count++;
+      continue;
+    }
+    if (!stat.isFile()) {
+      blocks.push(`=== ${file} ===\n[file excluded: not a regular file]`);
+      count++;
+      continue;
+    }
+    if (stat.nlink > 1) {
+      // Hardlink — could point to a file outside the repo. We can't tell
+      // where the other links are without walking the FS, so we refuse.
+      // False positive: legitimate within-repo hardlinks (rare).
+      blocks.push(`=== ${file} ===\n[file excluded: hardlink]`);
       count++;
       continue;
     }

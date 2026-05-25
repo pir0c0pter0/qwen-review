@@ -75,6 +75,14 @@ function gitDiff(cwd, extraGlobs = []) {
       parts.push(`diff --git a/${file} b/${file}\nnew symlink\n[diff excluded: symlink target may be outside repo]`);
       continue;
     }
+    if (!stat.isFile()) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: not a regular file]`);
+      continue;
+    }
+    if (stat.nlink > 1) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: hardlink may point outside repo]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
@@ -181,6 +189,8 @@ function buildCheckPrompt({ cwd, diffOnly, extraGlobs = [] }) {
     let stat;
     try { stat = fs.lstatSync(fullPath); } catch { continue; }
     if (stat.isSymbolicLink()) { blocks.push(`=== ${file} ===\n[file excluded: symlink]`); continue; }
+    if (!stat.isFile()) { blocks.push(`=== ${file} ===\n[file excluded: not a regular file]`); continue; }
+    if (stat.nlink > 1) { blocks.push(`=== ${file} ===\n[file excluded: hardlink]`); continue; }
     let buf;
     try { buf = fs.readFileSync(fullPath); } catch { continue; }
     if (isBinary(buf)) { blocks.push(`=== ${file} ===\n[file excluded: binary]`); continue; }

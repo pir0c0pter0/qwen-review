@@ -325,6 +325,47 @@ test("hook excludes UNTRACKED .env from diff body (no secret leak)", () => {
   }
 });
 
+test("hook never reads through hardlinks (target may be outside repo)", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  const outside = path.join(makeTempDir(), "outside-hardlink-secret.txt");
+  fs.writeFileSync(outside, "DO_NOT_LEAK_VIA_HARDLINK_FROM_OUTSIDE\n");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    // Untracked HARDLINK (not symlink) to a file OUTSIDE the repo
+    fs.linkSync(outside, path.join(repo, "hardlink-to-outside.txt"));
+    fs.writeFileSync(path.join(repo, "real.js"), "export const x = 1;\n");
+    execSync("git add real.js", { cwd: repo });
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "added hardlink and real.js", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    // Hardlinked content NEVER reaches the prompt
+    assert.doesNotMatch(sent, /DO_NOT_LEAK_VIA_HARDLINK_FROM_OUTSIDE/);
+    // Hardlink is mentioned but excluded
+    assert.match(sent, /hardlink-to-outside\.txt/);
+    assert.match(sent, /\[file excluded: hardlink\]|\[diff excluded: hardlink/);
+    // Real file still goes through
+    assert.match(sent, /real\.js/);
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+    cleanup(path.dirname(outside));
+  }
+});
+
 test("hook never reads through symlinks (target may be outside repo)", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();
