@@ -1,10 +1,19 @@
 const MODE_DEFAULTS = {
-  fast: { maxTokens: 1024, timeoutMs: 120_000, enableThinking: false },
-  deep: { maxTokens: 8192, timeoutMs: 600_000, enableThinking: true }
+  fast:     { maxTokens: 1024, timeoutMs: 120_000, enableThinking: false },
+  thinking: { maxTokens: 8192, timeoutMs: 600_000, enableThinking: true }
 };
 
+// `deep` is kept as a backward-compat alias for `thinking`.
+const MODE_ALIASES = { deep: "thinking" };
+
+export function normalizeMode(mode) {
+  const m = String(mode ?? "").toLowerCase();
+  return MODE_ALIASES[m] ?? m;
+}
+
 export function resolveModeParams(mode = "fast", overrides = {}) {
-  const base = MODE_DEFAULTS[mode] ?? MODE_DEFAULTS.fast;
+  const canonical = normalizeMode(mode);
+  const base = MODE_DEFAULTS[canonical] ?? MODE_DEFAULTS.fast;
   return { ...base, ...overrides };
 }
 

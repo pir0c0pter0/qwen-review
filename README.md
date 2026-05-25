@@ -20,19 +20,38 @@ Sem dependências npm — só precisa de **Node ≥ 18** no PATH.
 
 ## Configuração
 
-### Mínimo viável
+### Wizard interativo (recomendado)
 
-```bash
-export QWEN_API_KEY=sk-...        # obrigatório
-```
-
-Depois, dentro de uma sessão Claude Code, no diretório do seu projeto:
+Dentro do Claude Code, rode (com `!` pra abrir terminal real, necessário pra readline):
 
 ```
-/qwen-review:setup --enable
+! node ~/.claude/plugins/local/qwen-review/scripts/qwen-review.mjs wizard
 ```
 
-O gate fica habilitado apenas para esse workspace (state isolado por sha256 do realpath).
+(ou ajuste o path se você instalou via marketplace)
+
+O wizard pergunta API key, base URL (4 presets + custom), modelo e modo (`fast`/`thinking`), mostra summary, confirma e escreve atomicamente em `~/.claude/settings.json` preservando todos os outros campos.
+
+Depois:
+- `/reload-plugins` (ou restart Claude Code)
+- `/qwen-review:setup --enable` (liga o gate por workspace)
+
+### Mínimo viável manual
+
+Se preferir editar `~/.claude/settings.json` na mão:
+
+```json
+{
+  "env": {
+    "QWEN_API_KEY": "sk-...",
+    "QWEN_BASE_URL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "QWEN_MODEL": "qwen3-max",
+    "QWEN_REVIEW_MODE": "fast"
+  }
+}
+```
+
+Depois `/qwen-review:setup --enable` no workspace. O gate fica habilitado apenas pra esse workspace (state isolado por sha256 do realpath).
 
 ### Todas as variáveis de ambiente
 
@@ -41,7 +60,7 @@ O gate fica habilitado apenas para esse workspace (state isolado por sha256 do r
 | `QWEN_API_KEY` | sim | — | Sem ela, o gate auto-skip com aviso |
 | `QWEN_BASE_URL` | não | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | OpenAI-compat endpoint |
 | `QWEN_MODEL` | não | `qwen3-max` | Override para outros nomes (ex: `qwen/qwen3-max` no OpenRouter) |
-| `QWEN_REVIEW_MODE` | não | `fast` | `fast` (1024 tok, 120s, sem thinking) ou `deep` (8192 tok, 600s, thinking) |
+| `QWEN_REVIEW_MODE` | não | `fast` | `fast` (1024 tok, 120s, sem thinking) ou `thinking` (8192 tok, 600s, `enable_thinking=true`). `deep` é alias backward-compat de `thinking`. |
 | `QWEN_REVIEW_TIMEOUT_MS` | não | 120000 / 600000 | Override do timeout HTTP |
 | `QWEN_REVIEW_MAX_TOKENS` | não | 1024 / 8192 | Override do cap de saída |
 | `QWEN_REVIEW_MAX_FILES` | não | 5 | Quantos arquivos enviar em `CHANGED_FILES_CONTENT` |
@@ -53,6 +72,7 @@ O gate fica habilitado apenas para esse workspace (state isolado por sha256 do r
 
 | Comando | Descrição |
 |---|---|
+| `/qwen-review:wizard` | Wizard interativo (instrução pra rodar via `!`) — configura API key, base URL, model e mode em `~/.claude/settings.json` |
 | `/qwen-review:setup [--enable\|--disable]` | Liga/desliga o gate no workspace atual + ping na API |
 | `/qwen-review:status` | Mostra config + último review |
 | `/qwen-review:check [--diff-only]` | Roda review manual on-demand contra `git diff HEAD` |

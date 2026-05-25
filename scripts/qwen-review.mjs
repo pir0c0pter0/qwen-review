@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -111,7 +114,10 @@ function readEnv() {
       process.env.QWEN_BASE_URL ||
       "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     model: process.env.QWEN_MODEL || "qwen3-max",
-    mode: process.env.QWEN_REVIEW_MODE === "deep" ? "deep" : "fast"
+    mode: (() => {
+      const m = (process.env.QWEN_REVIEW_MODE || "").toLowerCase();
+      return (m === "thinking" || m === "deep") ? "thinking" : "fast";
+    })()
   };
 }
 
@@ -233,6 +239,127 @@ async function cmdCheck(args) {
   process.stdout.write(result.content + "\n");
 }
 
+// --- Wizard (interactive config) ---
+
+const BASE_URL_PRESETS = [
+  { label: "DashScope International", url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" },
+  { label: "DashScope China",         url: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+  { label: "OpenRouter",              url: "https://openrouter.ai/api/v1" }
+];
+
+function settingsPath() {
+  return path.join(os.homedir(), ".claude", "settings.json");
+}
+
+function loadSettings() {
+  const p = settingsPath();
+  if (!fs.existsSync(p)) return { __path: p, data: {} };
+  try {
+    return { __path: p, data: JSON.parse(fs.readFileSync(p, "utf8")) };
+  } catch (err) {
+    throw new Error(`cannot parse ${p}: ${err.message} (fix or backup the file before running wizard)`);
+  }
+}
+
+function writeSettingsAtomic(p, data) {
+  const tmp = `${p}.qwen-tmp`;
+  const text = JSON.stringify(data, null, 2) + "\n";
+  fs.writeFileSync(tmp, text, { encoding: "utf8" });
+  fs.renameSync(tmp, p);
+}
+
+async function cmdWizard() {
+  const settings = loadSettings();
+  const currentEnv = settings.data.env ?? {};
+
+  const rl = readline.createInterface({ input, output });
+  const ask = async (label, def) => {
+    const suffix = def !== undefined && def !== "" ? ` [${def}]` : "";
+    const ans = (await rl.question(`${label}${suffix}: `)).trim();
+    return ans || def || "";
+  };
+
+  output.write("\n");
+  output.write("qwen-review setup wizard\n");
+  output.write("────────────────────────\n");
+  output.write(`Reading current config from ${settings.__path}\n\n`);
+
+  // 1. API key
+  const currentKey = currentEnv.QWEN_API_KEY ?? "";
+  output.write(`Current API key: ${currentKey ? maskKey(currentKey) : "(not set)"}\n`);
+  const newKeyRaw = await ask("New API key (blank to keep current)", "");
+  const newKey = newKeyRaw || currentKey;
+
+  // 2. Base URL preset
+  output.write("\nBase URL options:\n");
+  BASE_URL_PRESETS.forEach((p, i) => output.write(`  ${i + 1}) ${p.label} — ${p.url}\n`));
+  output.write(`  ${BASE_URL_PRESETS.length + 1}) Custom (enter manually)\n`);
+  const defChoice = (() => {
+    const idx = BASE_URL_PRESETS.findIndex((p) => p.url === currentEnv.QWEN_BASE_URL);
+    return idx >= 0 ? String(idx + 1) : "1";
+  })();
+  const baseChoice = await ask(`Choose 1-${BASE_URL_PRESETS.length + 1}`, defChoice);
+  let newBaseUrl;
+  const idx = parseInt(baseChoice, 10) - 1;
+  if (idx >= 0 && idx < BASE_URL_PRESETS.length) {
+    newBaseUrl = BASE_URL_PRESETS[idx].url;
+  } else {
+    newBaseUrl = await ask("Custom base URL", currentEnv.QWEN_BASE_URL ?? "");
+  }
+
+  // 3. Model
+  const newModel = await ask("\nModel", currentEnv.QWEN_MODEL ?? "qwen3-max");
+
+  // 4. Mode
+  output.write("\nReview mode:\n");
+  output.write("  fast — 1024 tokens, ~3-15s, sem thinking (default — recomendado pro dia-a-dia)\n");
+  output.write("  thinking — 8192 tokens, ~60-180s, enable_thinking=true (review profundo)\n");
+  const currentMode = (() => {
+    const m = (currentEnv.QWEN_REVIEW_MODE || "").toLowerCase();
+    return (m === "thinking" || m === "deep") ? "thinking" : "fast";
+  })();
+  let newMode = (await ask("Mode (fast|thinking)", currentMode)).toLowerCase();
+  if (newMode === "deep") newMode = "thinking";
+  if (newMode !== "fast" && newMode !== "thinking") {
+    output.write(`(invalid '${newMode}', defaulting to fast)\n`);
+    newMode = "fast";
+  }
+
+  rl.close();
+
+  // Summary
+  output.write("\n────────────────────────\nWill write to env:\n");
+  output.write(`  QWEN_API_KEY      = ${newKey ? maskKey(newKey) : "(empty)"}\n`);
+  output.write(`  QWEN_BASE_URL     = ${newBaseUrl}\n`);
+  output.write(`  QWEN_MODEL        = ${newModel}\n`);
+  output.write(`  QWEN_REVIEW_MODE  = ${newMode}\n`);
+  output.write(`Target: ${settings.__path}\n\n`);
+
+  const rl2 = readline.createInterface({ input, output });
+  const confirm = (await rl2.question("Write these values? [y/N] ")).trim().toLowerCase();
+  rl2.close();
+  if (confirm !== "y" && confirm !== "yes") {
+    output.write("Aborted, nothing written.\n");
+    return;
+  }
+
+  // Atomic merge into settings.env, preserving everything else
+  settings.data.env = {
+    ...currentEnv,
+    QWEN_API_KEY: newKey,
+    QWEN_BASE_URL: newBaseUrl,
+    QWEN_MODEL: newModel,
+    QWEN_REVIEW_MODE: newMode
+  };
+  writeSettingsAtomic(settings.__path, settings.data);
+
+  output.write("\n✓ Saved.\n\n");
+  output.write("Next steps:\n");
+  output.write("  1) /reload-plugins  (or restart Claude Code if marketplace was just added)\n");
+  output.write("  2) /qwen-review:setup --enable  (per-workspace, ativa o stop gate)\n");
+  output.write("  3) /qwen-review:status  (confirma config + ping API)\n");
+}
+
 async function main() {
   const [subcommand, ...rest] = process.argv.slice(2);
   switch (subcommand) {
@@ -245,8 +372,11 @@ async function main() {
     case "check":
       await cmdCheck(rest);
       break;
+    case "wizard":
+      await cmdWizard();
+      break;
     default:
-      process.stderr.write(`usage: qwen-review <setup|status|check> [args]\n`);
+      process.stderr.write(`usage: qwen-review <setup|status|check|wizard> [args]\n`);
       process.exit(2);
   }
 }

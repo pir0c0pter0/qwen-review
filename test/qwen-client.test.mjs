@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { callQwen, resolveModeParams } from "../scripts/lib/qwen-client.mjs";
+import { callQwen, resolveModeParams, normalizeMode } from "../scripts/lib/qwen-client.mjs";
 
 function mockFetch(handler) {
   const original = globalThis.fetch;
@@ -23,11 +23,26 @@ test("resolveModeParams returns fast defaults", () => {
   assert.equal(p.enableThinking, false);
 });
 
-test("resolveModeParams returns deep defaults", () => {
+test("resolveModeParams returns thinking defaults", () => {
+  const p = resolveModeParams("thinking");
+  assert.equal(p.maxTokens, 8192);
+  assert.equal(p.timeoutMs, 600_000);
+  assert.equal(p.enableThinking, true);
+});
+
+test("resolveModeParams accepts 'deep' as alias for 'thinking' (backward compat)", () => {
   const p = resolveModeParams("deep");
   assert.equal(p.maxTokens, 8192);
   assert.equal(p.timeoutMs, 600_000);
   assert.equal(p.enableThinking, true);
+});
+
+test("normalizeMode maps deep -> thinking and preserves others", () => {
+  assert.equal(normalizeMode("deep"), "thinking");
+  assert.equal(normalizeMode("DEEP"), "thinking");
+  assert.equal(normalizeMode("thinking"), "thinking");
+  assert.equal(normalizeMode("fast"), "fast");
+  assert.equal(normalizeMode("bogus"), "bogus");
 });
 
 test("resolveModeParams unknown mode falls back to fast", () => {

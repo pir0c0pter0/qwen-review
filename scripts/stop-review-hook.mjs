@@ -245,7 +245,10 @@ function readEnvConfig() {
       process.env.QWEN_BASE_URL ||
       "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     model: process.env.QWEN_MODEL || "qwen3-max",
-    mode: process.env.QWEN_REVIEW_MODE === "deep" ? "deep" : "fast",
+    mode: (() => {
+      const m = (process.env.QWEN_REVIEW_MODE || "").toLowerCase();
+      return (m === "thinking" || m === "deep") ? "thinking" : "fast";
+    })(),
     maxFiles: Number(process.env.QWEN_REVIEW_MAX_FILES) || 5,
     redactEnabled: process.env.QWEN_REVIEW_REDACT_SECRETS !== "0",
     extraGlobs: (process.env.QWEN_REVIEW_EXCLUDE_GLOBS || "")
