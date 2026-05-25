@@ -95,7 +95,7 @@ Depois, no Claude Code:
 ! node ~/.claude/plugins/cache/pir0c0pter0/qwen-review/<versão>/scripts/qwen-review.mjs wizard
 ```
 
-Descubra `<versão>` com `ls ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/`.
+Descubra `<versão>` com `ls ~/.claude/plugins/cache/pir0c0pter0/qwen-review/`.
 
 ---
 
