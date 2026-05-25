@@ -13,6 +13,7 @@ import { loadState, getConfig, setConfig } from "./lib/config.mjs";
 import { callQwen } from "./lib/qwen-client.mjs";
 import { loadTemplate, interpolate, truncate } from "./lib/prompt.mjs";
 import { redactSecrets, shouldSkipFile, isBinary } from "./lib/redactor.mjs";
+import { loadSettings, writeSettingsAtomic } from "./lib/settings.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
@@ -247,27 +248,6 @@ const BASE_URL_PRESETS = [
   { label: "OpenRouter",              url: "https://openrouter.ai/api/v1" }
 ];
 
-function settingsPath() {
-  return path.join(os.homedir(), ".claude", "settings.json");
-}
-
-function loadSettings() {
-  const p = settingsPath();
-  if (!fs.existsSync(p)) return { __path: p, data: {} };
-  try {
-    return { __path: p, data: JSON.parse(fs.readFileSync(p, "utf8")) };
-  } catch (err) {
-    throw new Error(`cannot parse ${p}: ${err.message} (fix or backup the file before running wizard)`);
-  }
-}
-
-function writeSettingsAtomic(p, data) {
-  const tmp = `${p}.qwen-tmp`;
-  const text = JSON.stringify(data, null, 2) + "\n";
-  fs.writeFileSync(tmp, text, { encoding: "utf8" });
-  fs.renameSync(tmp, p);
-}
-
 async function cmdWizard() {
   const settings = loadSettings();
   const currentEnv = settings.data.env ?? {};
@@ -282,7 +262,7 @@ async function cmdWizard() {
   output.write("\n");
   output.write("qwen-review setup wizard\n");
   output.write("────────────────────────\n");
-  output.write(`Reading current config from ${settings.__path}\n\n`);
+  output.write(`Reading current config from ${settings.path}\n\n`);
 
   // 1. API key
   const currentKey = currentEnv.QWEN_API_KEY ?? "";
@@ -333,7 +313,7 @@ async function cmdWizard() {
   output.write(`  QWEN_BASE_URL     = ${newBaseUrl}\n`);
   output.write(`  QWEN_MODEL        = ${newModel}\n`);
   output.write(`  QWEN_REVIEW_MODE  = ${newMode}\n`);
-  output.write(`Target: ${settings.__path}\n\n`);
+  output.write(`Target: ${settings.path}\n\n`);
 
   const rl2 = readline.createInterface({ input, output });
   const confirm = (await rl2.question("Write these values? [y/N] ")).trim().toLowerCase();
@@ -343,7 +323,7 @@ async function cmdWizard() {
     return;
   }
 
-  // Atomic merge into settings.env, preserving everything else
+  // Atomic merge into settings.env, preserving everything else AND existing perms
   settings.data.env = {
     ...currentEnv,
     QWEN_API_KEY: newKey,
@@ -351,9 +331,9 @@ async function cmdWizard() {
     QWEN_MODEL: newModel,
     QWEN_REVIEW_MODE: newMode
   };
-  writeSettingsAtomic(settings.__path, settings.data);
+  const written = writeSettingsAtomic(settings.path, settings.data);
 
-  output.write("\n✓ Saved.\n\n");
+  output.write(`\n✓ Saved (mode ${written.mode.toString(8)}).\n\n`);
   output.write("Next steps:\n");
   output.write("  1) /reload-plugins  (or restart Claude Code if marketplace was just added)\n");
   output.write("  2) /qwen-review:setup --enable  (per-workspace, ativa o stop gate)\n");
