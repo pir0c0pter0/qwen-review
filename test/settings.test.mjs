@@ -5,12 +5,12 @@ import path from "node:path";
 import { loadSettings, writeSettingsAtomic } from "../scripts/lib/settings.mjs";
 import { makeTempDir, cleanup } from "./helpers/tempdir.mjs";
 
-test("writeSettingsAtomic preserves existing 0o600 perms (does not widen)", () => {
+test("writeSettingsAtomic always writes 0o600 (keeps an already-tight file tight)", () => {
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
   try {
     fs.writeFileSync(file, JSON.stringify({ env: { OLD: "x" } }), { mode: 0o600 });
-    fs.chmodSync(file, 0o600); // explicit, in case umask interfered
+    fs.chmodSync(file, 0o600);
     writeSettingsAtomic(file, { env: { NEW: "y" } });
     const mode = fs.statSync(file).mode & 0o777;
     assert.equal(mode, 0o600, `expected 0o600, got 0o${mode.toString(8)}`);
@@ -21,7 +21,10 @@ test("writeSettingsAtomic preserves existing 0o600 perms (does not widen)", () =
   }
 });
 
-test("writeSettingsAtomic preserves existing 0o644 perms (does not narrow either)", () => {
+test("writeSettingsAtomic tightens 0o644 to 0o600 (credentials file deserves owner-only)", () => {
+  // Contract change vs. earlier behavior: we no longer preserve 0o644.
+  // settings.json holds API keys; 0o600 is the only correct mode and we
+  // refuse to widen post-write (which would also introduce a TOCTOU).
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
   try {
@@ -29,7 +32,7 @@ test("writeSettingsAtomic preserves existing 0o644 perms (does not narrow either
     fs.chmodSync(file, 0o644);
     writeSettingsAtomic(file, { env: { K: "v" } });
     const mode = fs.statSync(file).mode & 0o777;
-    assert.equal(mode, 0o644, `expected 0o644, got 0o${mode.toString(8)}`);
+    assert.equal(mode, 0o600, `expected tightening to 0o600, got 0o${mode.toString(8)}`);
   } finally {
     cleanup(dir);
   }
@@ -101,54 +104,43 @@ test("writeSettingsAtomic never creates a world-readable tmp even with umask 0o0
   }
 });
 
-test("writeSettingsAtomic still preserves 0o644 of an existing file even with restrictive umask 0o077", () => {
-  // Inverse case: user had a 0o644 file (their explicit choice), the
-  // wizard must not silently TIGHTEN to 0o600 just because umask is paranoid.
+test("writeSettingsAtomic ignores umask entirely — always 0o600", () => {
+  // With strict-0o600 contract, umask is irrelevant: the explicit mode
+  // passed to openSync is a ceiling, and umask only removes bits, so the
+  // result is always exactly 0o600.
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
-  fs.writeFileSync(file, "{}");
-  fs.chmodSync(file, 0o644);
   const originalUmask = process.umask(0o077);
   try {
     writeSettingsAtomic(file, { env: { K: "v" } });
-    const mode = fs.statSync(file).mode & 0o777;
-    assert.equal(mode, 0o644, `expected 0o644 preserved, got 0o${mode.toString(8)}`);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally {
     process.umask(originalUmask);
     cleanup(dir);
   }
 });
 
-test("writeSettingsAtomic does NOT widen the tmp file even when preserving 0o644", () => {
-  // Regression: previous impl did fchmod(fd, 0o644) on the tmp BEFORE
-  // rename. That meant during the tmp's lifetime credentials sat in a
-  // 0o644 file on disk readable by others. The new impl keeps tmp at
-  // 0o600 until renamed; widening to 0o644 happens on the dest path.
-  // We probe this by intercepting fs.chmodSync to record what mode/path
-  // was set when.
+test("writeSettingsAtomic NEVER calls chmod (no widening anywhere, no TOCTOU window)", () => {
+  // Strict guarantee: no chmod is ever issued, on tmp OR dest. The mode
+  // is fixed at 0o600 by the open() call's mode arg, and umask can only
+  // reduce. Removing chmod entirely eliminates the chmod-after-rename
+  // TOCTOU vulnerability (hostile process could swap dest for a symlink
+  // between rename and chmod, redirecting our chmod to a target file).
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
-  const tmp = `${file}.qwen-tmp`;
   fs.writeFileSync(file, "{}");
   fs.chmodSync(file, 0o644);
 
-  // Snapshot fs.chmodSync to record call sequence
   const originalChmod = fs.chmodSync;
   const calls = [];
   fs.chmodSync = function(p, mode) {
-    calls.push({ path: p, mode: mode & 0o777, tmpExists: fs.existsSync(tmp) });
+    calls.push({ path: p, mode: mode & 0o777 });
     return originalChmod.call(fs, p, mode);
   };
   try {
     writeSettingsAtomic(file, { env: { K: "v" } });
-    // After write: final dest mode is 0o644 (preserved)
-    assert.equal(fs.statSync(file).mode & 0o777, 0o644);
-    // No chmod was ever invoked on the tmp path while it existed
-    const tmpChmods = calls.filter((c) => c.path === tmp);
-    assert.equal(tmpChmods.length, 0, `tmp should never be chmod'd, got: ${JSON.stringify(tmpChmods)}`);
-    // The widening chmod targeted the dest, not the tmp
-    const destWiden = calls.filter((c) => c.path === file && c.mode === 0o644);
-    assert.equal(destWiden.length, 1, "expected exactly one chmod 0o644 on the dest");
+    assert.equal(calls.length, 0, `expected zero chmod calls, got: ${JSON.stringify(calls)}`);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally {
     fs.chmodSync = originalChmod;
     cleanup(dir);

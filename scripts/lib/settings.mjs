@@ -20,35 +20,38 @@ export function loadSettings(p = settingsPath()) {
 }
 
 /**
- * Atomically write settings.json preserving the existing file's permissions.
- * If the file does not exist, uses SAFE_DEFAULT_MODE (0o600) since the
- * payload likely contains credentials.
+ * Atomically write settings.json. ALWAYS sets mode 0o600 — owner-only.
  *
- * Two security properties enforced:
+ * Why we never preserve a wider mode (e.g. 0o644) the user may have had:
  *
- * 1. Credentials never land on disk in a file wider than 0o600, even
- *    momentarily. The tmp file is opened with mode 0o600 (umask can only
- *    REMOVE bits, never add) and stays at 0o600 until renamed into place.
- *    Any widening to a preserved mode like 0o644 happens AFTER the rename,
- *    so the only "widened" file on disk has the user-chosen final name.
+ *   - The payload contains an API key. 0o600 is the only correct mode
+ *     for a credentials file; 0o644 leaks the key to every local user.
+ *   - Doing a chmod-after-rename to widen creates a TOCTOU window where
+ *     a hostile process running as the same UID could unlink the dest
+ *     and plant a symlink, then our chmod adjusts the symlink's target.
+ *     The simplest fix is to never widen.
+ *   - Strict guarantee: this function always produces a file at exactly
+ *     mode 0o600. No exceptions, no best-effort widening.
  *
- * 2. No partial publishes. We use fs.writeFileSync(fd, buffer), which
- *    internally loops over short writes until all bytes are flushed before
- *    returning. Then close, fsync-by-rename. If writeFileSync throws
- *    mid-stream the tmp is left orphan (cleaned up on next run via unlink)
- *    and the destination is never touched.
+ * If a user genuinely needs 0o644 on settings.json (e.g. for a non-secret
+ * shared config in a sandbox), they can chmod manually — outside this
+ * function's contract.
+ *
+ * Atomicity / safety:
+ *   1. Unlink stale tmp first (defensive — prior crash may have left
+ *      a wider tmp).
+ *   2. Open tmp with O_CREAT|O_EXCL and mode 0o600. Umask can only REMOVE
+ *      bits, never add — 0o600 is a hard ceiling.
+ *   3. fs.writeFileSync(fd, buffer) loops short writes internally — no
+ *      partial publish.
+ *   4. Close, then atomic rename onto the dest. Rename preserves the
+ *      tmp's mode (0o600), so the dest is at 0o600 the instant it
+ *      replaces the prior file.
+ *   5. On any error mid-stream, the dest is never touched. Tmp is left
+ *      orphan and cleaned up on the next run.
  */
 export function writeSettingsAtomic(p, data) {
-  const text = JSON.stringify(data, null, 2) + "\n";
-  const payload = Buffer.from(text, "utf8");
-  let finalMode = SAFE_DEFAULT_MODE;
-  if (fs.existsSync(p)) {
-    try {
-      finalMode = fs.statSync(p).mode & 0o777;
-    } catch {
-      finalMode = SAFE_DEFAULT_MODE;
-    }
-  }
+  const payload = Buffer.from(JSON.stringify(data, null, 2) + "\n", "utf8");
   const tmp = `${p}.qwen-tmp`;
   try {
     fs.unlinkSync(tmp);
@@ -61,22 +64,10 @@ export function writeSettingsAtomic(p, data) {
     SAFE_DEFAULT_MODE
   );
   try {
-    // writeFileSync(fd, buffer) loops over short writes internally
     fs.writeFileSync(fd, payload);
   } finally {
     fs.closeSync(fd);
   }
   fs.renameSync(tmp, p);
-  // Widening happens AFTER rename — never on the tmp. The dest will be at
-  // 0o600 for a microsecond between rename and chmod; that's safer than
-  // having the tmp at the wider mode.
-  if (finalMode !== SAFE_DEFAULT_MODE) {
-    try {
-      fs.chmodSync(p, finalMode);
-    } catch {
-      // best-effort widen-to-preserved-mode; if it fails the dest stays
-      // at the safer 0o600. Better safe than over-permissioned.
-    }
-  }
-  return { path: p, mode: finalMode };
+  return { path: p, mode: SAFE_DEFAULT_MODE };
 }
