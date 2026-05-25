@@ -24,28 +24,54 @@ export function loadSettings(p = settingsPath()) {
  * If the file does not exist, uses SAFE_DEFAULT_MODE (0o600) since the
  * payload likely contains credentials.
  *
- * Important: we use writeFileSync + chmodSync + rename (not the `mode` option
- * on writeFileSync) because Node's underlying open() applies umask, which
- * would silently widen permissions on systems with permissive umasks.
+ * Security property: the credentials NEVER touch disk in a world-readable
+ * file, even momentarily. To achieve this we:
+ *   1. Unlink any stale tmp first (defensive — old tmp may have wider mode).
+ *   2. Open the tmp with mode 0o600 BEFORE writing any bytes. Since umask
+ *      can only REMOVE bits from a mode, a max of 0o600 guarantees the
+ *      file is at most owner-readable from the moment it appears in the FS.
+ *   3. Write the content via the fd.
+ *   4. fchmod the fd to the preserved mode (may widen back to 0o644 if
+ *      that was the original file's mode — user's choice, not our default).
+ *   5. Close + rename.
+ *
+ * We use fchmod (not chmod by path) to avoid a TOCTOU race where another
+ * process could swap the tmp path between chmod and rename.
  */
 export function writeSettingsAtomic(p, data) {
   const text = JSON.stringify(data, null, 2) + "\n";
-  let mode = SAFE_DEFAULT_MODE;
+  let finalMode = SAFE_DEFAULT_MODE;
   if (fs.existsSync(p)) {
     try {
-      mode = fs.statSync(p).mode & 0o777;
+      finalMode = fs.statSync(p).mode & 0o777;
     } catch {
-      mode = SAFE_DEFAULT_MODE;
+      finalMode = SAFE_DEFAULT_MODE;
     }
   }
   const tmp = `${p}.qwen-tmp`;
-  fs.writeFileSync(tmp, text, "utf8");
   try {
-    fs.chmodSync(tmp, mode);
-  } catch {
-    // best-effort: if chmod fails (e.g. unusual FS), proceed with whatever
-    // perms the OS assigned. The rename below is still atomic.
+    fs.unlinkSync(tmp);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  const fd = fs.openSync(
+    tmp,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    SAFE_DEFAULT_MODE
+  );
+  try {
+    fs.writeSync(fd, text);
+    if (finalMode !== SAFE_DEFAULT_MODE) {
+      try {
+        fs.fchmodSync(fd, finalMode);
+      } catch {
+        // best-effort widen-to-preserved-mode; if it fails the file stays
+        // at the safer 0o600. Better safe than over-permissioned.
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
   }
   fs.renameSync(tmp, p);
-  return { path: p, mode };
+  return { path: p, mode: finalMode };
 }
