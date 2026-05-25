@@ -15,11 +15,11 @@ Inspirado no `stop-review-gate` do plugin oficial `openai-codex`, com chamada HT
 **Forma rápida — slash commands (instala e ativa direto):**
 
 ```
-/plugin marketplace add pir0c0pter0/claude-plugins
-/plugin install qwen-review@pir0c0pter0
+/plugins marketplace add pir0c0pter0/claude-plugins
+/plugins install qwen-review@pir0c0pter0
 ```
 
-`/plugin install` já ativa o plugin — não precisa de `enable` separado (esse só serve pra reativar depois de `/plugin disable`).
+`/plugins install` já ativa o plugin — não precisa de `enable` separado (esse só serve pra reativar depois de `/plugins disable`).
 
 **Forma manual — `~/.claude/settings.json` (user-level):**
 
