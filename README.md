@@ -12,14 +12,16 @@ Inspirado no `stop-review-gate` do plugin oficial `openai-codex`, com chamada HT
 
 ### Via marketplace `pir0c0pter0` (recomendado)
 
-**Forma rápida — slash command:**
+**Forma rápida — slash commands (instala e ativa direto):**
 
 ```
 /plugin marketplace add pir0c0pter0/claude-plugins
 /plugin install qwen-review@pir0c0pter0
 ```
 
-**Forma manual — editar `~/.claude/settings.json`** (útil pra setups compartilhados em team):
+`/plugin install` já ativa o plugin — não precisa de `enable` separado (esse só serve pra reativar depois de `/plugin disable`).
+
+**Forma manual — `~/.claude/settings.json` (user-level):**
 
 ```json
 {
@@ -35,6 +37,14 @@ Inspirado no `stop-review-gate` do plugin oficial `openai-codex`, com chamada HT
 ```
 
 Pela rota manual, **feche e abra o Claude Code** na primeira vez (marketplace nova só carrega no startup).
+
+**Forma team — `<project>/.claude/settings.json` committed:**
+
+Mesmo JSON acima, mas no diretório `.claude/` do **projeto** (não home). Commitado no repo, todo dev do time pega a config automaticamente ao clonar.
+
+⚠️ **Nunca** ponha `env.QWEN_API_KEY` em settings project-level — segredo no repo. A chave fica sempre em `~/.claude/settings.json` per-user (o wizard escreve lá).
+
+Precedência (alto → baixo): managed → `.claude/settings.local.json` (gitignored) → `.claude/settings.json` (committed) → `~/.claude/settings.json`.
 
 ### Via clone direto (standalone)
 
