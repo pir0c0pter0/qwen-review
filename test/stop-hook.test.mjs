@@ -325,6 +325,53 @@ test("hook excludes UNTRACKED .env from diff body (no secret leak)", () => {
   }
 });
 
+test("tracked hardlinks do NOT leak via git diff", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  const outside = path.join(makeTempDir(), "outside-tracked-secret.txt");
+  fs.writeFileSync(outside, "ORIGINAL\n");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    // Hardlink outside file into repo, then track it
+    fs.linkSync(outside, path.join(repo, "tracked-link.txt"));
+    execSync("git add tracked-link.txt", { cwd: repo });
+    execSync('git -c commit.gpgsign=false commit -q -m "add link"', { cwd: repo });
+    // Now modify the OUTSIDE file — working tree of tracked-link.txt sees the change
+    // (same inode); git diff HEAD -- tracked-link.txt would dump the new content
+    fs.writeFileSync(outside, "ORIGINAL\nTRACKED_HARDLINK_LEAK_SENTINEL\n");
+    // Add one real source change so hook proceeds
+    fs.writeFileSync(path.join(repo, "real.js"), "export const x = 1;\n");
+    execSync("git add real.js", { cwd: repo });
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "edited link and real.js", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    // Tracked hardlink leak sentinel NEVER reaches the prompt
+    assert.doesNotMatch(sent, /TRACKED_HARDLINK_LEAK_SENTINEL/);
+    // Tracked file is excluded with placeholder
+    assert.match(sent, /tracked-link\.txt/);
+    assert.match(sent, /\[diff excluded: hardlink|\[file excluded: hardlink/);
+    // Real file passes through
+    assert.match(sent, /real\.js/);
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+    cleanup(path.dirname(outside));
+  }
+});
+
 test("hook never reads through hardlinks (target may be outside repo)", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();

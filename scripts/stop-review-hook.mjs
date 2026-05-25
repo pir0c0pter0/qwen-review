@@ -87,11 +87,29 @@ function syntheticDiffForUntracked(cwd, file) {
   }
 }
 
+function unsafeFileNote(file, stat) {
+  if (stat.isSymbolicLink()) return "symlink target may be outside repo";
+  if (!stat.isFile()) return "not a regular file";
+  if (stat.nlink > 1) return "hardlink may point outside repo";
+  return null;
+}
+
 function gitDiff(cwd, extraGlobs = []) {
   const parts = [];
   for (const file of trackedChangedFiles(cwd)) {
     if (shouldSkipFile(file, extraGlobs)) {
       parts.push(`diff --git a/${file} b/${file}\n[diff excluded: sensitive path]`);
+      continue;
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(path.join(cwd, file));
+    } catch {
+      continue;
+    }
+    const reason = unsafeFileNote(file, stat);
+    if (reason) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
       continue;
     }
     const d = trackedDiffForFile(cwd, file);
@@ -108,16 +126,9 @@ function gitDiff(cwd, extraGlobs = []) {
     } catch {
       continue;
     }
-    if (stat.isSymbolicLink()) {
-      parts.push(`diff --git a/${file} b/${file}\nnew symlink\n[diff excluded: symlink target may be outside repo]`);
-      continue;
-    }
-    if (!stat.isFile()) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: not a regular file]`);
-      continue;
-    }
-    if (stat.nlink > 1) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: hardlink may point outside repo]`);
+    const reason = unsafeFileNote(file, stat);
+    if (reason) {
+      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
       continue;
     }
     const d = syntheticDiffForUntracked(cwd, file);
