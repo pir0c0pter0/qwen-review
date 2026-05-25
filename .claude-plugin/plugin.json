@@ -1,6 +1,6 @@
 {
   "name": "qwen-review",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Stop-time review gate via Qwen 3.7 Max API (OpenAI-compatible). Espelha o codex stop-review-gate.",
   "author": {
     "name": "Mario Junior"

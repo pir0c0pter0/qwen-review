@@ -1,42 +1,80 @@
 ---
-description: Show the ready-to-paste wizard command (interactive config of QWEN_API_KEY, base URL, model, mode)
-allowed-tools: Bash(echo:*)
+description: Configura QWEN_API_KEY + base URL + model + mode interativamente via AskUserQuestion (sem precisar de terminal real)
+allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
-O wizard precisa de stdin interativo, então **roda via `!` no Claude Code** (terminal real, não via Bash tool).
+Você (Claude) é quem vai conduzir o wizard usando `AskUserQuestion` — não precisa do prefixo `!` nem de terminal real. Fluxo:
 
-Run:
+**1.** Primeiro, leia o estado atual pra mostrar defaults:
 
 ```bash
-echo ""
-echo "Copie e cole a linha abaixo no Claude Code (o ! no início é essencial):"
-echo ""
-echo "! node \"${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs\" wizard"
-echo ""
-echo "Ou crie um alias permanente (uma vez só):"
-echo "  echo 'alias qwen-wizard=\"node ${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs wizard\"' >> ~/.bashrc"
-echo "  source ~/.bashrc"
-echo "Depois, sempre que quiser configurar:"
-echo "  ! qwen-wizard"
-echo ""
+node "${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs" status
 ```
 
-Depois de exibir o output, lembre o usuário:
+Anote `apiKey` (mascarada se já existe), `baseUrl`, `model`, `mode`.
 
-**O wizard pergunta (em sequência):**
-1. **API key** — mostra a atual mascarada (`sk-•••xyz`), Enter sem digitar mantém
-2. **Base URL** — 4 presets pra escolher por número:
-   1. DashScope International (Alibaba Cloud global, padrão)
-   2. DashScope China (conta cn)
-   3. OpenRouter
-   4. Custom (cole sua URL)
-3. **Model** — default `qwen3-max` (pode trocar pro nome aceito no seu provider)
-4. **Mode** — `fast` (1024 tok, 3-15s) ou `thinking` (8192 tok, 60-180s, deep reasoning)
+**2.** Faça as 4 perguntas via `AskUserQuestion` (em uma única chamada batched — máximo 4 questions). Cada uma com defaults derivados do status:
 
-**Resultado:** summary com todos os valores → confirmação `y/N` → escrita atômica em `~/.claude/settings.json` (mode `0o600`, owner-only, preserva todos os outros campos).
+- **Base URL** — header: "Base URL", 4 options:
+  1. `DashScope International` (description: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
+  2. `DashScope China` (description: `https://dashscope.aliyuncs.com/compatible-mode/v1`)
+  3. `OpenRouter` (description: `https://openrouter.ai/api/v1`)
+  4. `Custom` (description: cola URL OpenAI-compat de qualquer provider)
+  Marque o atual como `(atual)` no label se bater com um preset.
 
-**Próximos passos (após wizard terminar):**
-- `/reload-plugins` (pega env vars novas)
-- `/qwen-review:setup --enable` (liga o gate no projeto atual)
-- `/qwen-review:setup --enable --thinking` (liga + força modo thinking só nesse workspace)
-- `/qwen-review:status` (confirma config + ping na API + mostra modeSource)
+- **Model** — header: "Modelo", 3 options:
+  - `qwen3-max` (DashScope)
+  - `qwen/qwen3-max` (OpenRouter)
+  - `Custom` (outro nome)
+  Marque o atual.
+
+- **Mode** — header: "Modo de review", 2 options:
+  - `fast (1024 tok, 3-15s, sem thinking) — pro dia-a-dia` (Recommended se atual é fast)
+  - `thinking (8192 tok, 60-180s, enable_thinking=true) — review profundo` (Recommended se atual é thinking)
+
+- **API key** — header: "API key", 2 options:
+  - `Manter a atual (sk-•••XXX)` (Recommended se já existe key) — só aparece se status mostrou `envOk: true`
+  - `Substituir por uma nova` (vai abrir input livre — usuário cola nova chave)
+
+**3.** Se o usuário escolher "Custom" base URL OU "Custom" model OU "Substituir API key", faça uma SEGUNDA `AskUserQuestion` com a opção `Other` (sempre disponível) pra capturar o texto livre.
+
+**4.** Mostre summary curto pro usuário:
+```
+Vou escrever em ~/.claude/settings.json:
+  QWEN_API_KEY      = sk-•••XXX
+  QWEN_BASE_URL     = https://...
+  QWEN_MODEL        = qwen3-max
+  QWEN_REVIEW_MODE  = fast
+```
+Pergunte via `AskUserQuestion` "Confirmar?" com options `Sim, salvar` / `Não, cancelar`.
+
+**5.** Se confirmado, invoque o apply-config:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs" apply-config \
+  --api-key="<chave-ou-omit-com-keep-key>" \
+  --base-url="<url-escolhida>" \
+  --model="<modelo-escolhido>" \
+  --mode="<fast|thinking>"
+```
+
+Se o usuário escolheu manter a chave atual, use `--keep-key` no lugar de `--api-key=...`.
+
+O comando devolve JSON com `ok: true` + `written` + `env` (apiKey mascarada). Reporte ao usuário:
+- ✓ Salvo com sucesso
+- Lembre dos próximos passos do JSON `nextSteps`:
+  - `/reload-plugins`
+  - `/qwen-review:setup --enable`
+  - `/qwen-review:status`
+
+**Tratamento de erro:** se `apply-config` exit 2 com stderr `missing required ...`, mostre a mensagem e pergunte se quer tentar de novo.
+
+---
+
+**Alternativa terminal** (se o usuário preferir o wizard interativo de readline tradicional):
+
+```
+! node "${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs" wizard
+```
+
+Mas via AskUserQuestion (fluxo principal acima) é mais ergonômico — funciona dentro do Claude Code direto, sem precisar de `!`.

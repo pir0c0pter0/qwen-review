@@ -159,24 +159,37 @@ async function cmdSetup(args) {
   const env = readEnv();
   const actions = [];
 
-  const currentConfig = getConfig(workspaceRoot);
-  let nextGate = currentConfig.stopReviewGate;
-  if (args.includes("--enable")) {
-    setConfig(workspaceRoot, "stopReviewGate", true);
-    nextGate = true;
-    actions.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
-  } else if (args.includes("--disable")) {
-    setConfig(workspaceRoot, "stopReviewGate", false);
-    nextGate = false;
-    actions.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  // ---- Validate ALL flags BEFORE any state mutation ----
+  // (Previously: --enable wrote state before --mode=bogus rejected the call,
+  // leaving the gate enabled despite the visible error and exit 2.)
+
+  const wantsEnable = args.includes("--enable");
+  const wantsDisable = args.includes("--disable");
+  if (wantsEnable && wantsDisable) {
+    process.stderr.write("qwen-review: --enable and --disable are mutually exclusive\n");
+    process.exit(2);
   }
 
-  // Per-workspace mode override (separate from global QWEN_REVIEW_MODE env)
   const requestedMode = parseModeArg(args);
   if (requestedMode === null) {
     process.stderr.write("qwen-review: invalid --mode value (use fast or thinking)\n");
     process.exit(2);
   }
+
+  // ---- All flags valid — now safe to mutate ----
+
+  const currentConfig = getConfig(workspaceRoot);
+  let nextGate = currentConfig.stopReviewGate;
+  if (wantsEnable) {
+    setConfig(workspaceRoot, "stopReviewGate", true);
+    nextGate = true;
+    actions.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
+  } else if (wantsDisable) {
+    setConfig(workspaceRoot, "stopReviewGate", false);
+    nextGate = false;
+    actions.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
   if (requestedMode) {
     setConfig(workspaceRoot, "mode", requestedMode);
     actions.push(`Set workspace mode to '${requestedMode}'.`);
@@ -385,6 +398,84 @@ async function cmdWizard() {
   output.write("  3) /qwen-review:status  (confirma config + ping API)\n");
 }
 
+function parseFlagValue(args, name) {
+  // Accepts --name=VALUE or --name VALUE
+  const eq = `--${name}=`;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith(eq)) return a.slice(eq.length);
+    if (a === `--${name}` && i + 1 < args.length) return args[i + 1];
+  }
+  return undefined;
+}
+
+function cmdApplyConfig(args) {
+  // Non-interactive wizard target. Designed for Claude Code to invoke after
+  // gathering values via AskUserQuestion — no readline, no TTY needed.
+  // Required flags: --api-key, --base-url, --model, --mode
+  // Optional: --keep-key  (preserves existing key when --api-key not passed)
+  const apiKey = parseFlagValue(args, "api-key");
+  const baseUrl = parseFlagValue(args, "base-url");
+  const model = parseFlagValue(args, "model");
+  let mode = parseFlagValue(args, "mode");
+  const keepKey = args.includes("--keep-key");
+
+  const missing = [];
+  if (!baseUrl) missing.push("--base-url");
+  if (!model) missing.push("--model");
+  if (!mode) missing.push("--mode");
+  if (!apiKey && !keepKey) missing.push("--api-key (or --keep-key to keep current)");
+  if (missing.length) {
+    process.stderr.write(
+      `qwen-review apply-config: missing required ${missing.join(", ")}\n` +
+      `usage: qwen-review apply-config --api-key=K --base-url=URL --model=NAME --mode=fast|thinking\n` +
+      `       (use --keep-key instead of --api-key to keep the existing value)\n`
+    );
+    process.exit(2);
+  }
+
+  mode = mode.toLowerCase();
+  if (mode === "deep") mode = "thinking";
+  if (mode !== "fast" && mode !== "thinking") {
+    process.stderr.write(`qwen-review apply-config: invalid --mode '${mode}' (use fast or thinking)\n`);
+    process.exit(2);
+  }
+
+  const settings = loadSettings();
+  const currentEnv = settings.data.env ?? {};
+  const finalKey = apiKey || currentEnv.QWEN_API_KEY || "";
+  if (!finalKey) {
+    process.stderr.write(`qwen-review apply-config: --keep-key passed but no existing QWEN_API_KEY in ${settings.path}\n`);
+    process.exit(2);
+  }
+
+  settings.data.env = {
+    ...currentEnv,
+    QWEN_API_KEY: finalKey,
+    QWEN_BASE_URL: baseUrl,
+    QWEN_MODEL: model,
+    QWEN_REVIEW_MODE: mode
+  };
+  const written = writeSettingsAtomic(settings.path, settings.data);
+
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    written: written.path,
+    mode: written.mode.toString(8),
+    env: {
+      QWEN_API_KEY: maskKey(finalKey),
+      QWEN_BASE_URL: baseUrl,
+      QWEN_MODEL: model,
+      QWEN_REVIEW_MODE: mode
+    },
+    nextSteps: [
+      "/reload-plugins",
+      "/qwen-review:setup --enable",
+      "/qwen-review:status"
+    ]
+  }, null, 2) + "\n");
+}
+
 async function main() {
   const [subcommand, ...rest] = process.argv.slice(2);
   switch (subcommand) {
@@ -400,8 +491,11 @@ async function main() {
     case "wizard":
       await cmdWizard();
       break;
+    case "apply-config":
+      cmdApplyConfig(rest);
+      break;
     default:
-      process.stderr.write(`usage: qwen-review <setup|status|check|wizard> [args]\n`);
+      process.stderr.write(`usage: qwen-review <setup|status|check|wizard|apply-config> [args]\n`);
       process.exit(2);
   }
 }

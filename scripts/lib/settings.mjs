@@ -52,6 +52,10 @@ export function loadSettings(p = settingsPath()) {
  */
 export function writeSettingsAtomic(p, data) {
   const payload = Buffer.from(JSON.stringify(data, null, 2) + "\n", "utf8");
+  // Ensure parent dir exists — first wizard run on a brand-new user has no
+  // ~/.claude/ yet. mkdir mode 0o700 so the dir is also owner-only (matches
+  // the credential file's 0o600 inside it).
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
   const tmp = `${p}.qwen-tmp`;
   try {
     fs.unlinkSync(tmp);
