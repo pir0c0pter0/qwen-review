@@ -79,7 +79,7 @@ Imprime a linha exata pra você copiar (já resolve o `${CLAUDE_PLUGIN_ROOT}`) �
 
 ```bash
 # Cole no terminal (substitui ~/.bashrc por ~/.zshrc se usa zsh)
-echo 'alias qwen-wizard="node $(ls -d ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/*/qwen-review)/scripts/qwen-review.mjs wizard"' >> ~/.bashrc
+echo 'alias qwen-wizard="node $(ls -d ~/.claude/plugins/cache/pir0c0pter0/qwen-review/*)/scripts/qwen-review.mjs wizard"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -92,7 +92,7 @@ Depois, no Claude Code:
 **C — invocação direta** (sem setup prévio, path completo):
 
 ```
-! node ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/<versão>/qwen-review/scripts/qwen-review.mjs wizard
+! node ~/.claude/plugins/cache/pir0c0pter0/qwen-review/<versão>/scripts/qwen-review.mjs wizard
 ```
 
 Descubra `<versão>` com `ls ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/`.
