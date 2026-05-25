@@ -441,6 +441,25 @@ function cmdApplyConfig(args) {
     process.exit(2);
   }
 
+  // Defensive: detect masked/redacted strings being passed as the real key.
+  // /qwen-review:status outputs apiKey: "sk-•••efd" (masked). An LLM driving
+  // the wizard could mistakenly forward that display string as --api-key,
+  // which would silently overwrite the real key with the mask. Refuse it.
+  if (apiKey && /[•*]{2,}|\bREDACTED\b/.test(apiKey)) {
+    process.stderr.write(
+      `qwen-review apply-config: --api-key looks like a masked/display value ('${apiKey}'). ` +
+      `Use --keep-key to preserve the existing key, or pass the REAL key.\n`
+    );
+    process.exit(2);
+  }
+  if (apiKey && apiKey.length < 8) {
+    process.stderr.write(
+      `qwen-review apply-config: --api-key is suspiciously short (${apiKey.length} chars). ` +
+      `Real Qwen/DashScope keys are 30+ chars. Use --keep-key to preserve, or paste the full key.\n`
+    );
+    process.exit(2);
+  }
+
   const settings = loadSettings();
   const currentEnv = settings.data.env ?? {};
   const finalKey = apiKey || currentEnv.QWEN_API_KEY || "";

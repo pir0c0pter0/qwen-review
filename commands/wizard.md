@@ -33,10 +33,15 @@ Anote `apiKey` (mascarada se já existe), `baseUrl`, `model`, `mode`.
   - `thinking (8192 tok, 60-180s, enable_thinking=true) — review profundo` (Recommended se atual é thinking)
 
 - **API key** — header: "API key", 2 options:
-  - `Manter a atual (sk-•••XXX)` (Recommended se já existe key) — só aparece se status mostrou `envOk: true`
-  - `Substituir por uma nova` (vai abrir input livre — usuário cola nova chave)
+  - Se `envOk: true` (já tem chave): primeira opção `Manter a chave atual` `(Recommended)`, segunda opção `Substituir por uma nova`
+  - Se `envOk: false`: primeira opção `Configurar agora`, segunda opção `Pular por enquanto`
 
-**3.** Se o usuário escolher "Custom" base URL OU "Custom" model OU "Substituir API key", faça uma SEGUNDA `AskUserQuestion` com a opção `Other` (sempre disponível) pra capturar o texto livre.
+> ⚠️ **CRÍTICO**: NUNCA passe a string mascarada (ex: `sk-•••efd`) do `/status` output como `--api-key=...`. O status sempre mascara — não é o valor real da chave. Se o usuário escolhe "Manter", use `--keep-key`. Se escolhe "Substituir", siga a passo 3.
+
+**3.** Se o usuário escolheu:
+- **"Custom" base URL** OU **"Custom" model**: faça SEGUNDA `AskUserQuestion` com option `Other` pra capturar texto livre.
+- **"Substituir por uma nova" API key**: peça pro usuário no chat — "Cole sua nova API key aqui:" (mensagem normal, não AskUserQuestion). Quando ele colar, valide que tem ≥30 chars e começa com algo plausível tipo `sk-`. Se vier curta demais ou conter `•`, peça pra colar de novo. **NÃO use AskUserQuestion pra isso** — chave em formato livre não combina com options + chaves vão pro transcript de qualquer jeito mas pelo menos no chat normal o usuário tem expectativa clara.
+- **"Pular por enquanto"** (envOk=false): aborte o wizard com mensagem "Configure manualmente depois com /qwen-review:wizard ou edite ~/.claude/settings.json".
 
 **4.** Mostre summary curto pro usuário:
 ```
@@ -48,19 +53,30 @@ Vou escrever em ~/.claude/settings.json:
 ```
 Pergunte via `AskUserQuestion` "Confirmar?" com options `Sim, salvar` / `Não, cancelar`.
 
-**5.** Se confirmado, invoque o apply-config:
+**5.** Se confirmado, invoque o apply-config. Escolha **exatamente uma** das formas:
 
+**5a.** Manteve a chave atual:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs" apply-config \
-  --api-key="<chave-ou-omit-com-keep-key>" \
+  --keep-key \
   --base-url="<url-escolhida>" \
   --model="<modelo-escolhido>" \
   --mode="<fast|thinking>"
 ```
 
-Se o usuário escolheu manter a chave atual, use `--keep-key` no lugar de `--api-key=...`.
+**5b.** Substituiu por chave nova (usuário colou no passo 3):
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/qwen-review.mjs" apply-config \
+  --api-key="<CHAVE-REAL-COLADA-PELO-USUARIO>" \
+  --base-url="<url-escolhida>" \
+  --model="<modelo-escolhido>" \
+  --mode="<fast|thinking>"
+```
 
-O comando devolve JSON com `ok: true` + `written` + `env` (apiKey mascarada). Reporte ao usuário:
+> ⚠️ **NUNCA combine `--api-key=...` com `--keep-key`** — são mutuamente exclusivos.
+> ⚠️ **NUNCA passe valor mascarado** (com `•`, `*`, ou substring `REDACTED`). O comando rejeita com exit 2 e mensagem clara.
+
+O comando devolve JSON com `ok: true` + `written` + `env` (apiKey mascarada na saída pra log seguro). Reporte ao usuário:
 - ✓ Salvo com sucesso
 - Lembre dos próximos passos do JSON `nextSteps`:
   - `/reload-plugins`

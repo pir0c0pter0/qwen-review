@@ -85,6 +85,99 @@ test("apply-config rejects --mode=bogus without writing settings", () => {
   }
 });
 
+test("apply-config rejects masked api-key value (LLM safety guard)", () => {
+  // Regression: /qwen-review:status outputs apiKey: "sk-•••efd" (masked).
+  // An LLM driving the wizard could mistakenly forward that display string
+  // as --api-key, overwriting the REAL key with the mask. apply-config
+  // must detect '•' (bullet) and refuse.
+  const fakeHome = makeTempDir();
+  try {
+    // Plant a real key in settings.json first so we can verify it's not overwritten
+    fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome, ".claude", "settings.json"),
+      JSON.stringify({ env: { QWEN_API_KEY: "sk-the-real-key-must-survive" } })
+    );
+
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config",
+       "--api-key=sk-•••efd",  // the masked display value, not a real key
+       "--base-url=https://x",
+       "--model=y",
+       "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /masked\/display value/);
+    // The real key in settings.json MUST still be there, untouched.
+    const after = JSON.parse(fs.readFileSync(path.join(fakeHome, ".claude", "settings.json"), "utf8"));
+    assert.equal(after.env.QWEN_API_KEY, "sk-the-real-key-must-survive");
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config rejects api-key containing REDACTED substring", () => {
+  const fakeHome = makeTempDir();
+  try {
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--api-key=[REDACTED:openai-or-qwen-key]",
+       "--base-url=https://x", "--model=y", "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /masked\/display value/);
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config rejects suspiciously short api-key", () => {
+  const fakeHome = makeTempDir();
+  try {
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--api-key=sk-abc", "--base-url=https://x", "--model=y", "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /suspiciously short/);
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config --keep-key preserves the existing key (does not touch it)", () => {
+  const fakeHome = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome, ".claude", "settings.json"),
+      JSON.stringify({ env: { QWEN_API_KEY: "sk-original-must-survive-2026", OUTRO: "preservado" } })
+    );
+
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--keep-key", "--base-url=https://newurl", "--model=newmodel", "--mode=thinking"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 0, `stderr=${r.stderr}`);
+    const after = JSON.parse(fs.readFileSync(path.join(fakeHome, ".claude", "settings.json"), "utf8"));
+    // Key untouched
+    assert.equal(after.env.QWEN_API_KEY, "sk-original-must-survive-2026");
+    // Other fields updated
+    assert.equal(after.env.QWEN_BASE_URL, "https://newurl");
+    assert.equal(after.env.QWEN_MODEL, "newmodel");
+    assert.equal(after.env.QWEN_REVIEW_MODE, "thinking");
+    // Pre-existing unrelated field preserved
+    assert.equal(after.env.OUTRO, "preservado");
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
 test("apply-config writes settings.json on valid args (full happy path)", () => {
   const fakeHome = makeTempDir();
   try {
