@@ -65,34 +65,60 @@ git clone https://github.com/pir0c0pter0/qwen-review ~/.claude/plugins/local/qwe
 
 ### Wizard interativo (recomendado)
 
-Dentro do Claude Code, prefixe com `!` pra rodar em terminal real (necessário pro `readline` funcionar):
+Três formas, da mais fácil pra mais explícita:
+
+**A — slash command que te dá o comando pronto:**
+
+```
+/qwen-review:wizard
+```
+
+Imprime a linha exata pra você copiar (já resolve o `${CLAUDE_PLUGIN_ROOT}`) — você cola com `!` e o wizard abre.
+
+**B — alias permanente no shell** (uma vez só, depois é só `! qwen-wizard`):
+
+```bash
+# Cole no terminal (substitui ~/.bashrc por ~/.zshrc se usa zsh)
+echo 'alias qwen-wizard="node $(ls -d ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/*/qwen-review)/scripts/qwen-review.mjs wizard"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Depois, no Claude Code:
+
+```
+! qwen-wizard
+```
+
+**C — invocação direta** (sem setup prévio, path completo):
 
 ```
 ! node ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/<versão>/qwen-review/scripts/qwen-review.mjs wizard
 ```
 
-> Descobrir `<versão>`: `ls ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/`
+Descubra `<versão>` com `ls ~/.claude/plugins/cache/pir0c0pter0/claude-plugins/`.
 
-O wizard:
+---
 
-1. **Lê** o `~/.claude/settings.json` atual (cria se não existir)
-2. **Mostra** a API key atual mascarada (ex: `sk-•••efd`) e pergunta nova
-3. **Lista** 4 presets de base URL:
-   - DashScope International (default, conta global Alibaba Cloud)
-   - DashScope China (conta cn)
-   - OpenRouter (alternativa)
-   - Custom (cola qualquer URL OpenAI-compat)
-4. **Pergunta** o nome do modelo (default `qwen3-max`)
-5. **Oferece** modo:
-   - `fast` — 1024 tokens, ~3-15s, sem thinking (default, recomendado pro dia-a-dia)
-   - `thinking` — 8192 tokens, ~60-180s, `enable_thinking=true` (review profundo, pra mudanças sensíveis tipo segurança/billing/auth)
-6. **Mostra summary** com valores propostos
-7. **Pede confirmação** (`y` pra escrever, qualquer outra coisa aborta)
-8. **Escreve atomicamente** em `~/.claude/settings.json` preservando todos os outros campos
+### Fluxo do wizard
 
-### Manual
+1. **Lê** `~/.claude/settings.json` atual (cria se não existir)
+2. **API key:** mostra a atual mascarada (`sk-•••efd`), Enter sem digitar mantém
+3. **Base URL:** escolha por número entre 4 presets:
+   - `1` DashScope International (default, conta global Alibaba Cloud)
+   - `2` DashScope China (conta cn)
+   - `3` OpenRouter (alternativa, modelo precisa ser `qwen/qwen3-max`)
+   - `4` Custom (cole URL OpenAI-compat — ex: llama-server local, Ollama, etc.)
+4. **Model:** default `qwen3-max` (custo: troca pro nome aceito no seu provider)
+5. **Mode:** default global do plugin:
+   - `fast` — 1024 tokens, ~3-15s, sem thinking (recomendado pro dia-a-dia)
+   - `thinking` — 8192 tokens, ~60-180s, `enable_thinking=true` (deep reasoning)
+6. **Summary** com todos os valores + path de destino
+7. **Confirmação** `y`/`yes` pra escrever, qualquer outra coisa aborta
+8. **Escrita atômica** em `~/.claude/settings.json` (mode `0o600` strict, preserva todos os outros campos do JSON)
 
-Se preferir editar `~/.claude/settings.json` na mão:
+### Manual (sem wizard)
+
+Edite `~/.claude/settings.json` direto:
 
 ```json
 {
@@ -113,15 +139,26 @@ Se preferir editar `~/.claude/settings.json` na mão:
 
 State isolado por SHA-256 do realpath — só habilita no projeto atual.
 
+**Combina com override de modo per-workspace** (default é o `QWEN_REVIEW_MODE` global):
+
+```
+/qwen-review:setup --enable --thinking      # liga gate em modo thinking SÓ neste workspace
+/qwen-review:setup --enable --fast          # liga em fast (explicit)
+/qwen-review:setup --thinking               # só muda modo (gate já estava on/off)
+/qwen-review:setup --disable                # desliga gate (mantém preferência de modo)
+```
+
+O `/qwen-review:status` mostra `mode` + `modeSource` (`workspace` se você tem override, `env` se cai no QWEN_REVIEW_MODE).
+
 ---
 
 ## 📋 Comandos
 
 | Comando | Argumentos | Descrição |
 |---|---|---|
-| `/qwen-review:wizard` | — | Doc + instrução pra rodar wizard via `!` |
-| `/qwen-review:setup` | `[--enable\|--disable]` | Liga/desliga o gate + ping na API |
-| `/qwen-review:status` | — | Mostra config + último review (JSON) |
+| `/qwen-review:wizard` | — | Imprime comando pronto pra rodar wizard via `!` (3 opções: slash direto, alias permanente, path completo) |
+| `/qwen-review:setup` | `[--enable\|--disable] [--fast\|--thinking\|--mode=X]` | Liga/desliga gate + define modo per-workspace (combinável) + ping na API |
+| `/qwen-review:status` | — | Mostra config (env + workspace overrides) + último review (JSON) |
 | `/qwen-review:check` | `[--diff-only]` | Roda review manual on-demand contra `git diff HEAD` |
 
 ---
