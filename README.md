@@ -12,7 +12,14 @@ Inspirado no `stop-review-gate` do plugin oficial `openai-codex`, com chamada HT
 
 ### Via marketplace `pir0c0pter0` (recomendado)
 
-Editar `~/.claude/settings.json`:
+**Forma rápida — slash command:**
+
+```
+/plugin marketplace add pir0c0pter0/claude-plugins
+/plugin install qwen-review@pir0c0pter0
+```
+
+**Forma manual — editar `~/.claude/settings.json`** (útil pra setups compartilhados em team):
 
 ```json
 {
@@ -27,7 +34,7 @@ Editar `~/.claude/settings.json`:
 }
 ```
 
-**Feche e abra o Claude Code** (marketplace nova só carrega no startup).
+Pela rota manual, **feche e abra o Claude Code** na primeira vez (marketplace nova só carrega no startup).
 
 ### Via clone direto (standalone)
 
