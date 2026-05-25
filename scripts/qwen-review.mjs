@@ -412,24 +412,38 @@ function parseFlagValue(args, name) {
 function cmdApplyConfig(args) {
   // Non-interactive wizard target. Designed for Claude Code to invoke after
   // gathering values via AskUserQuestion — no readline, no TTY needed.
-  // Required flags: --api-key, --base-url, --model, --mode
-  // Optional: --keep-key  (preserves existing key when --api-key not passed)
+  // Required flags: --base-url, --model, --mode
+  // API key handling — exactly ONE of:
+  //   --api-key=K  : set/replace the API key
+  //   --keep-key   : preserve the existing key (errors if none exists)
+  //   --skip-key   : write base/model/mode but DON'T set a key (first-time
+  //                  user who picked 'Configure later' in the wizard).
+  //                  Preserves any existing key.
   const apiKey = parseFlagValue(args, "api-key");
   const baseUrl = parseFlagValue(args, "base-url");
   const model = parseFlagValue(args, "model");
   let mode = parseFlagValue(args, "mode");
   const keepKey = args.includes("--keep-key");
+  const skipKey = args.includes("--skip-key");
 
   const missing = [];
   if (!baseUrl) missing.push("--base-url");
   if (!model) missing.push("--model");
   if (!mode) missing.push("--mode");
-  if (!apiKey && !keepKey) missing.push("--api-key (or --keep-key to keep current)");
+  const keyModesSet = [Boolean(apiKey), keepKey, skipKey].filter(Boolean).length;
+  if (keyModesSet === 0) {
+    missing.push("--api-key (or --keep-key to keep current, or --skip-key to set later)");
+  } else if (keyModesSet > 1) {
+    process.stderr.write(
+      `qwen-review apply-config: --api-key, --keep-key, --skip-key are mutually exclusive (pick one)\n`
+    );
+    process.exit(2);
+  }
   if (missing.length) {
     process.stderr.write(
       `qwen-review apply-config: missing required ${missing.join(", ")}\n` +
-      `usage: qwen-review apply-config --api-key=K --base-url=URL --model=NAME --mode=fast|thinking\n` +
-      `       (use --keep-key instead of --api-key to keep the existing value)\n`
+      `usage: qwen-review apply-config --base-url=URL --model=NAME --mode=fast|thinking ` +
+      `(--api-key=K | --keep-key | --skip-key)\n`
     );
     process.exit(2);
   }
@@ -462,36 +476,63 @@ function cmdApplyConfig(args) {
 
   const settings = loadSettings();
   const currentEnv = settings.data.env ?? {};
-  const finalKey = apiKey || currentEnv.QWEN_API_KEY || "";
-  if (!finalKey) {
-    process.stderr.write(`qwen-review apply-config: --keep-key passed but no existing QWEN_API_KEY in ${settings.path}\n`);
-    process.exit(2);
+
+  // Resolve final key based on which mode was chosen
+  let finalKey;
+  if (apiKey) {
+    finalKey = apiKey;
+  } else if (keepKey) {
+    finalKey = currentEnv.QWEN_API_KEY || "";
+    if (!finalKey) {
+      process.stderr.write(
+        `qwen-review apply-config: --keep-key passed but no existing QWEN_API_KEY in ${settings.path}. ` +
+        `Use --api-key=<your-key> instead, or --skip-key to defer configuration.\n`
+      );
+      process.exit(2);
+    }
+  } else {
+    // skipKey: preserve any existing key (or omit if none)
+    finalKey = currentEnv.QWEN_API_KEY || "";
   }
 
-  settings.data.env = {
-    ...currentEnv,
-    QWEN_API_KEY: finalKey,
-    QWEN_BASE_URL: baseUrl,
-    QWEN_MODEL: model,
-    QWEN_REVIEW_MODE: mode
-  };
+  // Build the env block. If skipKey AND no existing key, OMIT the
+  // QWEN_API_KEY field entirely (cleaner than writing empty string).
+  const nextEnv = { ...currentEnv };
+  if (finalKey) {
+    nextEnv.QWEN_API_KEY = finalKey;
+  } else {
+    // skipKey + no existing — make sure we don't carry an empty string from currentEnv
+    delete nextEnv.QWEN_API_KEY;
+  }
+  nextEnv.QWEN_BASE_URL = baseUrl;
+  nextEnv.QWEN_MODEL = model;
+  nextEnv.QWEN_REVIEW_MODE = mode;
+
+  settings.data.env = nextEnv;
   const written = writeSettingsAtomic(settings.path, settings.data);
+
+  const nextSteps = ["/reload-plugins"];
+  if (finalKey) {
+    nextSteps.push("/qwen-review:setup --enable", "/qwen-review:status");
+  } else {
+    nextSteps.push(
+      "Set QWEN_API_KEY (re-run /qwen-review:wizard with --api-key, or edit ~/.claude/settings.json)",
+      "/qwen-review:status"
+    );
+  }
 
   process.stdout.write(JSON.stringify({
     ok: true,
     written: written.path,
     mode: written.mode.toString(8),
     env: {
-      QWEN_API_KEY: maskKey(finalKey),
+      QWEN_API_KEY: finalKey ? maskKey(finalKey) : null,
       QWEN_BASE_URL: baseUrl,
       QWEN_MODEL: model,
       QWEN_REVIEW_MODE: mode
     },
-    nextSteps: [
-      "/reload-plugins",
-      "/qwen-review:setup --enable",
-      "/qwen-review:status"
-    ]
+    keyAction: apiKey ? "replaced" : keepKey ? "kept" : finalKey ? "kept (skip-key with existing)" : "deferred",
+    nextSteps
   }, null, 2) + "\n");
 }
 

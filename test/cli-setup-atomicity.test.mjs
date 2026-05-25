@@ -178,6 +178,92 @@ test("apply-config --keep-key preserves the existing key (does not touch it)", (
   }
 });
 
+test("apply-config --skip-key on fresh user writes config WITHOUT QWEN_API_KEY", () => {
+  // First-time wizard flow: user picks 'configure later' for the key
+  // but wants to save base/model/mode. apply-config must not require
+  // a key and must omit QWEN_API_KEY from the env block entirely.
+  const fakeHome = makeTempDir();
+  try {
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--skip-key", "--base-url=https://x", "--model=qwen3-max", "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 0, `stderr=${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true);
+    assert.equal(out.keyAction, "deferred");
+    assert.equal(out.env.QWEN_API_KEY, null, "masked output should be null when key is absent");
+
+    const after = JSON.parse(fs.readFileSync(path.join(fakeHome, ".claude", "settings.json"), "utf8"));
+    assert.equal(after.env.QWEN_API_KEY, undefined, "QWEN_API_KEY field must be ABSENT, not empty string");
+    assert.equal(after.env.QWEN_BASE_URL, "https://x");
+    assert.equal(after.env.QWEN_MODEL, "qwen3-max");
+    assert.equal(after.env.QWEN_REVIEW_MODE, "fast");
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config --skip-key with existing key preserves it (does not erase)", () => {
+  const fakeHome = makeTempDir();
+  try {
+    fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome, ".claude", "settings.json"),
+      JSON.stringify({ env: { QWEN_API_KEY: "sk-pre-existing-survives-2026" } })
+    );
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--skip-key", "--base-url=https://y", "--model=z", "--mode=thinking"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 0);
+    const after = JSON.parse(fs.readFileSync(path.join(fakeHome, ".claude", "settings.json"), "utf8"));
+    // Key still there
+    assert.equal(after.env.QWEN_API_KEY, "sk-pre-existing-survives-2026");
+    // Other fields updated
+    assert.equal(after.env.QWEN_BASE_URL, "https://y");
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config rejects --api-key + --keep-key combined (mutual exclusion)", () => {
+  const fakeHome = makeTempDir();
+  try {
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--api-key=sk-12345678901234567890", "--keep-key",
+       "--base-url=https://x", "--model=y", "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /mutually exclusive/);
+    // No settings file should be written
+    assert.equal(fs.existsSync(path.join(fakeHome, ".claude", "settings.json")), false);
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
+test("apply-config rejects --keep-key when no existing key (clear error directs to alternatives)", () => {
+  const fakeHome = makeTempDir();
+  try {
+    const env = { HOME: fakeHome };
+    const r = runCli(
+      ["apply-config", "--keep-key", "--base-url=https://x", "--model=y", "--mode=fast"],
+      { cwd: fakeHome, env }
+    );
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /no existing QWEN_API_KEY/);
+    assert.match(r.stderr, /--api-key=<your-key>/);
+    assert.match(r.stderr, /--skip-key/);
+  } finally {
+    cleanup(fakeHome);
+  }
+});
+
 test("apply-config writes settings.json on valid args (full happy path)", () => {
   const fakeHome = makeTempDir();
   try {
