@@ -324,3 +324,45 @@ test("hook excludes UNTRACKED .env from diff body (no secret leak)", () => {
     cleanup(path.dirname(captureFile));
   }
 });
+
+test("hook never reads through symlinks (target may be outside repo)", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  const outside = path.join(makeTempDir(), "outside-secret.txt");
+  fs.writeFileSync(outside, "DO_NOT_LEAK_THIS_FROM_OUTSIDE_THE_REPO\n");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    // Untracked symlink pointing OUTSIDE the repo
+    fs.symlinkSync(outside, path.join(repo, "link-to-outside.txt"));
+    // Plus a normal file so the hook proceeds
+    fs.writeFileSync(path.join(repo, "real.js"), "export const x = 1;\n");
+    execSync("git add real.js", { cwd: repo });
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "added link and real.js", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    // Symlink target content NEVER reaches the prompt
+    assert.doesNotMatch(sent, /DO_NOT_LEAK_THIS_FROM_OUTSIDE_THE_REPO/);
+    // The link itself is mentioned as excluded
+    assert.match(sent, /link-to-outside\.txt/);
+    assert.match(sent, /\[file excluded: symlink\]|\[diff excluded: symlink/);
+    // Real file still goes through
+    assert.match(sent, /real\.js/);
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+    cleanup(path.dirname(outside));
+  }
+});

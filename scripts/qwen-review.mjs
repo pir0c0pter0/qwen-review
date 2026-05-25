@@ -65,6 +65,16 @@ function gitDiff(cwd, extraGlobs = []) {
       parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
       continue;
     }
+    let stat;
+    try {
+      stat = fs.lstatSync(path.join(cwd, file));
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      parts.push(`diff --git a/${file} b/${file}\nnew symlink\n[diff excluded: symlink target may be outside repo]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
@@ -167,8 +177,12 @@ function buildCheckPrompt({ cwd, diffOnly, extraGlobs = [] }) {
   const blocks = [];
   for (const file of files.slice(0, 5)) {
     if (shouldSkipFile(file, extraGlobs)) { blocks.push(`=== ${file} ===\n[file excluded: sensitive path]`); continue; }
+    const fullPath = path.join(cwd, file);
+    let stat;
+    try { stat = fs.lstatSync(fullPath); } catch { continue; }
+    if (stat.isSymbolicLink()) { blocks.push(`=== ${file} ===\n[file excluded: symlink]`); continue; }
     let buf;
-    try { buf = fs.readFileSync(path.join(cwd, file)); } catch { continue; }
+    try { buf = fs.readFileSync(fullPath); } catch { continue; }
     if (isBinary(buf)) { blocks.push(`=== ${file} ===\n[file excluded: binary]`); continue; }
     let c = buf.toString("utf8");
     c = redactSecrets(c);

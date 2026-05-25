@@ -102,6 +102,16 @@ function gitDiff(cwd, extraGlobs = []) {
       parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
       continue;
     }
+    let stat;
+    try {
+      stat = fs.lstatSync(path.join(cwd, file));
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      parts.push(`diff --git a/${file} b/${file}\nnew symlink\n[diff excluded: symlink target may be outside repo]`);
+      continue;
+    }
     const d = syntheticDiffForUntracked(cwd, file);
     if (d) parts.push(d);
   }
@@ -130,9 +140,24 @@ function buildChangedFilesContent(cwd, { redactEnabled, extraGlobs, maxFiles }) 
       continue;
     }
 
+    const fullPath = path.join(cwd, file);
+    let stat;
+    try {
+      stat = fs.lstatSync(fullPath);
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      // Never read through a symlink — target may be outside the repo
+      // (e.g., ~/.aws/credentials, /etc/shadow, dotfiles repos).
+      blocks.push(`=== ${file} ===\n[file excluded: symlink]`);
+      count++;
+      continue;
+    }
+
     let buf;
     try {
-      buf = fs.readFileSync(path.join(cwd, file));
+      buf = fs.readFileSync(fullPath);
     } catch {
       continue;
     }
