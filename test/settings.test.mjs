@@ -105,9 +105,7 @@ test("writeSettingsAtomic never creates a world-readable tmp even with umask 0o0
 });
 
 test("writeSettingsAtomic ignores umask entirely — always 0o600", () => {
-  // With strict-0o600 contract, umask is irrelevant: the explicit mode
-  // passed to openSync is a ceiling, and umask only removes bits, so the
-  // result is always exactly 0o600.
+  // With strict-0o600 contract, umask is irrelevant.
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
   const originalUmask = process.umask(0o077);
@@ -120,12 +118,48 @@ test("writeSettingsAtomic ignores umask entirely — always 0o600", () => {
   }
 });
 
-test("writeSettingsAtomic NEVER calls chmod (no widening anywhere, no TOCTOU window)", () => {
-  // Strict guarantee: no chmod is ever issued, on tmp OR dest. The mode
-  // is fixed at 0o600 by the open() call's mode arg, and umask can only
-  // reduce. Removing chmod entirely eliminates the chmod-after-rename
-  // TOCTOU vulnerability (hostile process could swap dest for a symlink
-  // between rename and chmod, redirecting our chmod to a target file).
+test("strict 0o600 holds even under pathological umask 0o277 (would yield 0o400 without fchmod)", () => {
+  // Regression for the case the explicit mode in openSync(...) is not
+  // enough: umask 0o277 masks 0o600 down to 0o400 (no owner write).
+  // Result must still be exactly 0o600 thanks to the fchmodSync on the fd.
+  const dir = makeTempDir();
+  const file = path.join(dir, "settings.json");
+  const originalUmask = process.umask(0o277);
+  try {
+    writeSettingsAtomic(file, { env: { K: "v" } });
+    const mode = fs.statSync(file).mode & 0o777;
+    assert.equal(mode, 0o600, `expected 0o600, got 0o${mode.toString(8)}`);
+    // Content must also be there (write succeeded despite umask)
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(data.env.K, "v");
+  } finally {
+    process.umask(originalUmask);
+    cleanup(dir);
+  }
+});
+
+test("strict 0o600 holds even when umask zeroes everything (0o600)", () => {
+  // umask 0o600 would mask 0o600 down to 0o000 — file with no perms at all,
+  // owner can't read or write. Without fchmod the file would be unusable.
+  const dir = makeTempDir();
+  const file = path.join(dir, "settings.json");
+  const originalUmask = process.umask(0o600);
+  try {
+    writeSettingsAtomic(file, { env: { K: "v" } });
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    process.umask(originalUmask);
+    cleanup(dir);
+  }
+});
+
+test("writeSettingsAtomic NEVER uses path-based chmod (only fchmod on fd — no TOCTOU)", () => {
+  // Strict guarantee: no chmodSync(path, mode) call is ever issued. The
+  // mode is enforced via fchmodSync on the open fd, which is TOCTOU-safe
+  // (the fd is bound to an inode; a hostile process can't swap the path
+  // for a symlink and trick us into chmod'ing a different file).
+  // fchmodSync calls ARE expected (that's how we enforce 0o600 against
+  // umask) — we only care that path-based chmod is absent.
   const dir = makeTempDir();
   const file = path.join(dir, "settings.json");
   fs.writeFileSync(file, "{}");
@@ -139,7 +173,7 @@ test("writeSettingsAtomic NEVER calls chmod (no widening anywhere, no TOCTOU win
   };
   try {
     writeSettingsAtomic(file, { env: { K: "v" } });
-    assert.equal(calls.length, 0, `expected zero chmod calls, got: ${JSON.stringify(calls)}`);
+    assert.equal(calls.length, 0, `expected zero path-chmod calls, got: ${JSON.stringify(calls)}`);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally {
     fs.chmodSync = originalChmod;

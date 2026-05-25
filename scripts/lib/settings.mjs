@@ -64,6 +64,14 @@ export function writeSettingsAtomic(p, data) {
     SAFE_DEFAULT_MODE
   );
   try {
+    // The mode arg to open() is masked by umask: effective = mode & ~umask.
+    // Under restrictive umasks (e.g. 0o277) the file would be created at
+    // 0o400 — owner can't even WRITE. Worse for the strict guarantee:
+    // result is NOT exactly 0o600. fchmodSync on the fd defeats umask AND
+    // is TOCTOU-safe (path can't be swapped between us and the inode the
+    // fd holds). We do this BEFORE write so credentials never land in a
+    // file with anything other than 0o600.
+    fs.fchmodSync(fd, SAFE_DEFAULT_MODE);
     fs.writeFileSync(fd, payload);
   } finally {
     fs.closeSync(fd);
