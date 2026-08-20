@@ -173,7 +173,8 @@ O `/qwen-review:status` mostra `mode` + `modeSource` (`workspace` se você tem o
 | `QWEN_REVIEW_MODE` | não | `fast` | `fast` (1024 tok, 120s) ou `thinking` (8192 tok, 600s, `enable_thinking=true`). `deep` é alias backward-compat de `thinking` |
 | `QWEN_REVIEW_TIMEOUT_MS` | não | 120000 / 600000 | Override do timeout HTTP |
 | `QWEN_REVIEW_MAX_TOKENS` | não | 1024 / 8192 | Override do cap de saída |
-| `QWEN_REVIEW_MAX_FILES` | não | 5 | Quantos arquivos enviar em `CHANGED_FILES_CONTENT` |
+| `QWEN_REVIEW_CALL_BUDGET_CHARS` | não | 100000 | Orçamento de chars (diff + conteúdo) por chamada ao Qwen; acima disso o review divide em lotes |
+| `QWEN_REVIEW_MAX_CALLS` | não | 3 | Máximo de chamadas ao Qwen por review; o excedente vira arquivos omitidos |
 | `QWEN_REVIEW_REDACT_SECRETS` | não | `1` | `0` desliga redaction (**NÃO recomendado**) |
 | `QWEN_REVIEW_EXCLUDE_GLOBS` | não | — | Globs extras pra skip, separados por `:` |
 | `QWEN_REVIEW_DEBUG` | não | `0` | `1` grava `.qwen-review-debug.log` no workspace |
@@ -248,13 +249,15 @@ hook (Stop, timeout 660s) → node scripts/stop-review-hook.mjs
 3. getConfig → stopReviewGate=false? → exit 0 silent
 4. QWEN_API_KEY ausente? → stderr warn + exit 0 (fail-open)
 5. shortcut: last_assistant E git diff (tracked+untracked) vazios? → exit 0
-6. buildPrompt:
+6. buildPrompt (por lote):
    - GIT_DIFF: per-file iteration, file-skip + symlink/hardlink check
-   - CHANGED_FILES_CONTENT: idem + isBinary + per-file cap 4000 chars
+   - CHANGED_FILES_CONTENT: idem + isBinary + caps per-file (diff 40000 / conteúdo 16000 chars)
    - LAST_ASSISTANT: truncate head 4000 + tail 4000
    - Tudo passa por redactSecrets() antes da interpolação
-7. callQwen com mode (fast|thinking) + overrides do env
-8. parseDecision(content) — primeira linha ALLOW:/BLOCK:
+   - packBatches: até `QWEN_REVIEW_CALL_BUDGET_CHARS` por chamada, máx
+     `QWEN_REVIEW_MAX_CALLS` chamadas; excedente vira `[N arquivos adicionais omitidos]`
+7. callQwen por lote com mode (fast|thinking) + overrides do env
+8. parseDecision(content) — primeira linha ALLOW:/BLOCK:; BLOCK em qualquer lote vence
 9. BLOCK → emit {decision:"block", reason:"Qwen review found issues: ..."}
 10. Qualquer throw → exit 0 (fail-open) + stderr note
 11. saveLastReview(state.json)
@@ -280,7 +283,7 @@ API call HTTP é o único ponto que pode bloquear. Tudo o mais libera o stop.
 ## 🧪 Desenvolvimento
 
 ```bash
-node --test test/*.test.mjs          # roda todos os testes (68 atualmente)
+node --test test/*.test.mjs          # roda todos os testes (93 atualmente)
 node scripts/qwen-review.mjs status  # sanity check sem rede
 ```
 
@@ -297,25 +300,30 @@ qwen-review/
 │   ├── setup.md                  # /qwen-review:setup [--enable|--disable]
 │   ├── status.md                 # /qwen-review:status
 │   └── check.md                  # /qwen-review:check [--diff-only]
-├── prompts/stop-review.md        # template com {{LAST_ASSISTANT}}, {{GIT_DIFF}}, {{CHANGED_FILES_CONTENT}}
+├── prompts/stop-review.md        # template com {{PART_NOTE}}, {{LAST_ASSISTANT}}, {{GIT_DIFF}}, {{CHANGED_FILES_CONTENT}}
 ├── scripts/
 │   ├── stop-review-hook.mjs      # entrada do hook (orquestrador)
 │   ├── qwen-review.mjs           # CLI (setup/status/check/wizard)
 │   └── lib/
 │       ├── workspace.mjs         # resolveWorkspaceRoot
 │       ├── config.mjs            # state.json por workspace
+│       ├── git.mjs               # helpers git compartilhados (diff/untracked por arquivo)
+│       ├── batch.mjs             # packBatches: empacota arquivos em lotes por orçamento de chars
 │       ├── redactor.mjs          # file-skip + regex
 │       ├── prompt.mjs            # template loader/interpolator/truncate
 │       ├── qwen-client.mjs       # fetch() OpenAI-compat + modes
 │       └── settings.mjs          # atomic writer com 0o600 strict
-├── test/                         # 68 testes (Node node:test)
+├── test/                         # 93 testes (Node node:test)
 │   ├── workspace.test.mjs
 │   ├── config.test.mjs
+│   ├── batch.test.mjs            # packBatches puro
 │   ├── redactor.test.mjs
 │   ├── prompt.test.mjs
 │   ├── qwen-client.test.mjs
 │   ├── settings.test.mjs
-│   └── stop-hook.test.mjs        # end-to-end com mock fetch via preload
+│   ├── cli-setup-atomicity.test.mjs
+│   ├── stop-hook.test.mjs        # end-to-end com mock fetch via preload
+│   └── stop-hook-batch.test.mjs  # cenários multi-lote (MOCK_RESPONSES)
 └── docs/superpowers/
     ├── specs/2026-05-23-qwen-review-gate-design.md
     ├── plans/2026-05-23-qwen-review-gate.md

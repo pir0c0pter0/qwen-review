@@ -1,104 +1,21 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { loadState, getConfig, setConfig } from "./lib/config.mjs";
 import { callQwen } from "./lib/qwen-client.mjs";
-import { loadTemplate, interpolate, truncate } from "./lib/prompt.mjs";
-import { redactSecrets, shouldSkipFile, isBinary } from "./lib/redactor.mjs";
+import { loadTemplate, interpolate } from "./lib/prompt.mjs";
+import { redactSecrets } from "./lib/redactor.mjs";
 import { loadSettings, writeSettingsAtomic } from "./lib/settings.mjs";
+import { collectChangedItems, contentBlockForItem } from "./lib/git.mjs";
+import { packBatches } from "./lib/batch.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-
-// --- Git helpers (mirror of stop-review-hook.mjs; v0.2 should extract to lib/git.mjs) ---
-
-function untrackedFiles(cwd) {
-  try {
-    return execFileSync("git", ["ls-files", "--others", "--exclude-standard"], {
-      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
-    }).split("\n").map(s => s.trim()).filter(Boolean);
-  } catch { return []; }
-}
-
-function trackedChangedFiles(cwd) {
-  try {
-    return execFileSync("git", ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"], {
-      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]
-    }).split("\n").map(s => s.trim()).filter(Boolean);
-  } catch { return []; }
-}
-
-function trackedDiffForFile(cwd, file) {
-  try {
-    return execFileSync("git", ["diff", "HEAD", "--no-color", "--", file], {
-      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch { return ""; }
-}
-
-function syntheticDiffForUntracked(cwd, file) {
-  try {
-    return execFileSync("git", ["diff", "--no-index", "--no-color", "/dev/null", file], {
-      cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch (err) {
-    return typeof err.stdout === "string" ? err.stdout : "";
-  }
-}
-
-function unsafeFileNote(file, stat) {
-  if (stat.isSymbolicLink()) return "symlink target may be outside repo";
-  if (!stat.isFile()) return "not a regular file";
-  if (stat.nlink > 1) return "hardlink may point outside repo";
-  return null;
-}
-
-function gitDiff(cwd, extraGlobs = []) {
-  const parts = [];
-  for (const file of trackedChangedFiles(cwd)) {
-    if (shouldSkipFile(file, extraGlobs)) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: sensitive path]`);
-      continue;
-    }
-    let stat;
-    try { stat = fs.lstatSync(path.join(cwd, file)); } catch { continue; }
-    const reason = unsafeFileNote(file, stat);
-    if (reason) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
-      continue;
-    }
-    const d = trackedDiffForFile(cwd, file);
-    if (d) parts.push(d);
-  }
-  for (const file of untrackedFiles(cwd)) {
-    if (shouldSkipFile(file, extraGlobs)) {
-      parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
-      continue;
-    }
-    let stat;
-    try { stat = fs.lstatSync(path.join(cwd, file)); } catch { continue; }
-    const reason = unsafeFileNote(file, stat);
-    if (reason) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
-      continue;
-    }
-    const d = syntheticDiffForUntracked(cwd, file);
-    if (d) parts.push(d);
-  }
-  return parts.filter(Boolean).join("\n");
-}
-
-function changedFiles(cwd) {
-  return [...trackedChangedFiles(cwd), ...untrackedFiles(cwd)];
-}
 
 // --- CLI helpers ---
 
@@ -246,34 +163,16 @@ function cmdStatus() {
   process.stdout.write(JSON.stringify(output, null, 2) + "\n");
 }
 
-function buildCheckPrompt({ cwd, diffOnly, extraGlobs = [] }) {
-  const diff = gitDiff(cwd, extraGlobs);
-  const files = changedFiles(cwd);
-
-  const blocks = [];
-  for (const file of files.slice(0, 5)) {
-    if (shouldSkipFile(file, extraGlobs)) { blocks.push(`=== ${file} ===\n[file excluded: sensitive path]`); continue; }
-    const fullPath = path.join(cwd, file);
-    let stat;
-    try { stat = fs.lstatSync(fullPath); } catch { continue; }
-    if (stat.isSymbolicLink()) { blocks.push(`=== ${file} ===\n[file excluded: symlink]`); continue; }
-    if (!stat.isFile()) { blocks.push(`=== ${file} ===\n[file excluded: not a regular file]`); continue; }
-    if (stat.nlink > 1) { blocks.push(`=== ${file} ===\n[file excluded: hardlink]`); continue; }
-    let buf;
-    try { buf = fs.readFileSync(fullPath); } catch { continue; }
-    if (isBinary(buf)) { blocks.push(`=== ${file} ===\n[file excluded: binary]`); continue; }
-    let c = buf.toString("utf8");
-    c = redactSecrets(c);
-    if (c.length > 4000) c = c.slice(0, 4000) + "\n[truncated]";
-    blocks.push(`=== ${file} ===\n${c}`);
-  }
-
-  const vars = {
-    LAST_ASSISTANT: diffOnly ? "" : "(manual /qwen-review:check invocation)",
-    GIT_DIFF: redactSecrets(truncate(diff, 12000)),
-    CHANGED_FILES_CONTENT: blocks.join("\n\n")
-  };
-  return interpolate(loadTemplate(ROOT_DIR, "stop-review"), vars);
+function buildCheckBatches({ cwd, extraGlobs = [] }) {
+  const items = collectChangedItems(cwd, extraGlobs).map((it) => ({
+    file: it.file,
+    diffText: redactSecrets(it.diffText),
+    contentBlock: contentBlockForItem(cwd, it, { redactEnabled: true }) ?? ""
+  }));
+  return packBatches(items, {
+    callBudgetChars: Number(process.env.QWEN_REVIEW_CALL_BUDGET_CHARS) || 100_000,
+    maxCalls: Number(process.env.QWEN_REVIEW_MAX_CALLS) || 3
+  });
 }
 
 async function cmdCheck(args) {
@@ -287,15 +186,36 @@ async function cmdCheck(args) {
   const extraGlobs = (process.env.QWEN_REVIEW_EXCLUDE_GLOBS || "")
     .split(":")
     .filter(Boolean);
-  const prompt = buildCheckPrompt({ cwd, diffOnly, extraGlobs });
-  const result = await callQwen({
-    apiKey: env.apiKey,
-    baseUrl: env.baseUrl,
-    model: env.model,
-    prompt,
-    mode: env.mode
-  });
-  process.stdout.write(result.content + "\n");
+  const { batches, omittedFiles } = buildCheckBatches({ cwd, extraGlobs });
+  // Sem mudanças → mantém uma chamada única com diff/conteúdo vazios (paridade).
+  const effective = batches.length === 0 ? [[]] : batches;
+  const nBatches = effective.length;
+  const template = loadTemplate(ROOT_DIR, "stop-review");
+
+  for (let i = 0; i < nBatches; i++) {
+    const batch = effective[i];
+    let filesContent = batch.map((it) => it.contentBlock).filter(Boolean).join("\n\n");
+    if (i === nBatches - 1 && omittedFiles.length > 0) {
+      filesContent += `\n\n[${omittedFiles.length} arquivos adicionais omitidos]`;
+    }
+    const prompt = interpolate(template, {
+      LAST_ASSISTANT: diffOnly ? "" : "(manual /qwen-review:check invocation)",
+      GIT_DIFF: batch.map((it) => it.diffText).filter(Boolean).join("\n"),
+      CHANGED_FILES_CONTENT: filesContent,
+      PART_NOTE: nBatches === 1
+        ? ""
+        : `Parte ${i + 1}/${nBatches} deste review. Arquivos neste lote: ${batch.map((it) => it.file).join(", ")}`
+    });
+    const result = await callQwen({
+      apiKey: env.apiKey,
+      baseUrl: env.baseUrl,
+      model: env.model,
+      prompt,
+      mode: env.mode
+    });
+    if (nBatches > 1) process.stdout.write(`=== parte ${i + 1}/${nBatches} ===\n`);
+    process.stdout.write(result.content + "\n");
+  }
 }
 
 // --- Wizard (interactive config) ---

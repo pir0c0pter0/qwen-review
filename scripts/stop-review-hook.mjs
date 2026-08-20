@@ -2,23 +2,22 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { getConfig, saveLastReview } from "./lib/config.mjs";
 import { loadTemplate, interpolate, truncate } from "./lib/prompt.mjs";
-import { redactSecrets, shouldSkipFile, isBinary } from "./lib/redactor.mjs";
+import { redactSecrets } from "./lib/redactor.mjs";
 import { callQwen } from "./lib/qwen-client.mjs";
+import { collectChangedItems, contentBlockForItem } from "./lib/git.mjs";
+import { packBatches } from "./lib/batch.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
-const TOTAL_FILES_CAP = 16_000;
-const PER_FILE_CAP = 4_000;
 const LAST_ASSISTANT_HEAD = 4_000;
 const LAST_ASSISTANT_TAIL = 4_000;
-const DIFF_HEAD = 12_000;
+const REASON_CAP = 500;
 
 function readHookInput() {
   try {
@@ -37,189 +36,6 @@ function emitBlock(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }) + "\n");
 }
 
-function untrackedFiles(cwd) {
-  try {
-    const out = execFileSync(
-      "git",
-      ["ls-files", "--others", "--exclude-standard"],
-      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-    );
-    return out.split("\n").map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-function trackedChangedFiles(cwd) {
-  try {
-    const out = execFileSync(
-      "git",
-      ["diff", "HEAD", "--name-only", "--diff-filter=ACMRT"],
-      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-    );
-    return out.split("\n").map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-function trackedDiffForFile(cwd, file) {
-  try {
-    return execFileSync(
-      "git",
-      ["diff", "HEAD", "--no-color", "--", file],
-      { cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"] }
-    );
-  } catch {
-    return "";
-  }
-}
-
-function syntheticDiffForUntracked(cwd, file) {
-  try {
-    return execFileSync(
-      "git",
-      ["diff", "--no-index", "--no-color", "/dev/null", file],
-      { cwd, encoding: "utf8", maxBuffer: 4_000_000, stdio: ["ignore", "pipe", "ignore"] }
-    );
-  } catch (err) {
-    return typeof err.stdout === "string" ? err.stdout : "";
-  }
-}
-
-function unsafeFileNote(file, stat) {
-  if (stat.isSymbolicLink()) return "symlink target may be outside repo";
-  if (!stat.isFile()) return "not a regular file";
-  if (stat.nlink > 1) return "hardlink may point outside repo";
-  return null;
-}
-
-function gitDiff(cwd, extraGlobs = []) {
-  const parts = [];
-  for (const file of trackedChangedFiles(cwd)) {
-    if (shouldSkipFile(file, extraGlobs)) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: sensitive path]`);
-      continue;
-    }
-    let stat;
-    try {
-      stat = fs.lstatSync(path.join(cwd, file));
-    } catch {
-      continue;
-    }
-    const reason = unsafeFileNote(file, stat);
-    if (reason) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
-      continue;
-    }
-    const d = trackedDiffForFile(cwd, file);
-    if (d) parts.push(d);
-  }
-  for (const file of untrackedFiles(cwd)) {
-    if (shouldSkipFile(file, extraGlobs)) {
-      parts.push(`diff --git a/${file} b/${file}\nnew file\n[diff excluded: sensitive path]`);
-      continue;
-    }
-    let stat;
-    try {
-      stat = fs.lstatSync(path.join(cwd, file));
-    } catch {
-      continue;
-    }
-    const reason = unsafeFileNote(file, stat);
-    if (reason) {
-      parts.push(`diff --git a/${file} b/${file}\n[diff excluded: ${reason}]`);
-      continue;
-    }
-    const d = syntheticDiffForUntracked(cwd, file);
-    if (d) parts.push(d);
-  }
-  return parts.filter(Boolean).join("\n");
-}
-
-function changedFiles(cwd) {
-  return [...trackedChangedFiles(cwd), ...untrackedFiles(cwd)];
-}
-
-function buildChangedFilesContent(cwd, { redactEnabled, extraGlobs, maxFiles }) {
-  const files = changedFiles(cwd);
-  if (files.length === 0) return "";
-
-  const blocks = [];
-  let count = 0;
-  let totalChars = 0;
-  let omitted = 0;
-
-  for (const file of files) {
-    if (count >= maxFiles) { omitted = files.length - count; break; }
-
-    if (shouldSkipFile(file, extraGlobs)) {
-      blocks.push(`=== ${file} ===\n[file excluded: sensitive path]`);
-      count++;
-      continue;
-    }
-
-    const fullPath = path.join(cwd, file);
-    let stat;
-    try {
-      stat = fs.lstatSync(fullPath);
-    } catch {
-      continue;
-    }
-    if (stat.isSymbolicLink()) {
-      // Never read through a symlink — target may be outside the repo
-      // (e.g., ~/.aws/credentials, /etc/shadow, dotfiles repos).
-      blocks.push(`=== ${file} ===\n[file excluded: symlink]`);
-      count++;
-      continue;
-    }
-    if (!stat.isFile()) {
-      blocks.push(`=== ${file} ===\n[file excluded: not a regular file]`);
-      count++;
-      continue;
-    }
-    if (stat.nlink > 1) {
-      // Hardlink — could point to a file outside the repo. We can't tell
-      // where the other links are without walking the FS, so we refuse.
-      // False positive: legitimate within-repo hardlinks (rare).
-      blocks.push(`=== ${file} ===\n[file excluded: hardlink]`);
-      count++;
-      continue;
-    }
-
-    let buf;
-    try {
-      buf = fs.readFileSync(fullPath);
-    } catch {
-      continue;
-    }
-
-    if (isBinary(buf)) {
-      blocks.push(`=== ${file} ===\n[file excluded: binary]`);
-      count++;
-      continue;
-    }
-
-    let content = buf.toString("utf8");
-    if (redactEnabled) content = redactSecrets(content);
-    if (content.length > PER_FILE_CAP) {
-      content = content.slice(0, PER_FILE_CAP) + "\n[truncated]";
-    }
-    const block = `=== ${file} ===\n${content}`;
-    if (totalChars + block.length > TOTAL_FILES_CAP) {
-      omitted = files.length - count;
-      break;
-    }
-    blocks.push(block);
-    totalChars += block.length;
-    count++;
-  }
-
-  let out = blocks.join("\n\n");
-  if (omitted > 0) out += `\n\n[${omitted} arquivos adicionais omitidos]`;
-  return out;
-}
-
 function parseDecision(text) {
   const first = String(text ?? "").split(/\r?\n/, 1)[0].trim();
   if (first.startsWith("ALLOW:")) {
@@ -229,6 +45,11 @@ function parseDecision(text) {
     return { allow: false, reason: first.slice("BLOCK:".length).trim() };
   }
   return null;
+}
+
+function joinReasons(reasons) {
+  const joined = reasons.filter(Boolean).join("; ");
+  return joined.length > REASON_CAP ? joined.slice(0, REASON_CAP) + "…" : joined;
 }
 
 function readEnvConfig() {
@@ -249,7 +70,8 @@ function readEnvConfig() {
       const m = (process.env.QWEN_REVIEW_MODE || "").toLowerCase();
       return (m === "thinking" || m === "deep") ? "thinking" : "fast";
     })(),
-    maxFiles: Number(process.env.QWEN_REVIEW_MAX_FILES) || 5,
+    callBudgetChars: Number(process.env.QWEN_REVIEW_CALL_BUDGET_CHARS) || 100_000,
+    maxCalls: Number(process.env.QWEN_REVIEW_MAX_CALLS) || 3,
     redactEnabled: process.env.QWEN_REVIEW_REDACT_SECRETS !== "0",
     extraGlobs: (process.env.QWEN_REVIEW_EXCLUDE_GLOBS || "")
       .split(":")
@@ -278,68 +100,119 @@ async function main() {
   }
 
   const lastAssistant = String(input.last_assistant_message ?? "");
-  const diff = gitDiff(workspaceRoot, env.extraGlobs);
-  if (!lastAssistant.trim() && !diff.trim()) return;
+
+  // Itens por arquivo: diff + bloco de conteúdo, ambos redigidos quando
+  // redactEnabled. Marcadores de exclusão (sensitive/symlink/hardlink/binary)
+  // vêm prontos de lib/git.mjs.
+  const items = collectChangedItems(workspaceRoot, env.extraGlobs).map((it) => ({
+    file: it.file,
+    diffText: env.redactEnabled ? redactSecrets(it.diffText) : it.diffText,
+    contentBlock:
+      contentBlockForItem(workspaceRoot, it, { redactEnabled: env.redactEnabled }) ?? ""
+  }));
+
+  const hasDiff = items.some((it) => it.diffText.trim());
+  if (!lastAssistant.trim() && !hasDiff) return;
 
   const truncatedLast = truncate(lastAssistant, LAST_ASSISTANT_HEAD, LAST_ASSISTANT_TAIL);
-  const truncatedDiff = truncate(diff, DIFF_HEAD);
-  const filesContent = buildChangedFilesContent(workspaceRoot, env);
+  const lastVar = env.redactEnabled ? redactSecrets(truncatedLast) : truncatedLast;
 
-  const vars = {
-    LAST_ASSISTANT: env.redactEnabled ? redactSecrets(truncatedLast) : truncatedLast,
-    GIT_DIFF: env.redactEnabled ? redactSecrets(truncatedDiff) : truncatedDiff,
-    CHANGED_FILES_CONTENT: filesContent
-  };
+  const { batches, omittedFiles } = packBatches(items, {
+    callBudgetChars: env.callBudgetChars,
+    maxCalls: env.maxCalls
+  });
+
+  // Sem mudanças → mantém uma chamada única com diff/conteúdo vazios (paridade).
+  const effective = batches.length === 0 ? [[]] : batches;
 
   const template = loadTemplate(ROOT_DIR, "stop-review");
-  const prompt = interpolate(template, vars);
+  const nBatches = effective.length;
+  const totals = { latencyMs: 0, promptTokens: 0, completionTokens: 0 };
+  const allowReasons = [];
+  const blockReasons = [];
+  let parsedAny = false;
+  const debugChunks = [];
 
-  let result;
-  try {
-    result = await callQwen({
-      apiKey: env.apiKey,
-      baseUrl: env.baseUrl,
-      model: env.model,
-      prompt,
-      mode: env.mode,
-      overrides: env.overrides
-    });
-  } catch (err) {
-    logNote(`API error: ${err.message || err}`);
-    return;
+  for (let i = 0; i < nBatches; i++) {
+    const batch = effective[i];
+    let filesContent = batch.map((it) => it.contentBlock).filter(Boolean).join("\n\n");
+    if (i === nBatches - 1 && omittedFiles.length > 0) {
+      filesContent += `\n\n[${omittedFiles.length} arquivos adicionais omitidos]`;
+    }
+    const vars = {
+      LAST_ASSISTANT: lastVar,
+      GIT_DIFF: batch.map((it) => it.diffText).filter(Boolean).join("\n"),
+      CHANGED_FILES_CONTENT: filesContent,
+      PART_NOTE: nBatches === 1
+        ? ""
+        : `Parte ${i + 1}/${nBatches} deste review. Arquivos neste lote: ${batch.map((it) => it.file).join(", ")}`
+    };
+    const prompt = interpolate(template, vars);
+
+    let result;
+    try {
+      result = await callQwen({
+        apiKey: env.apiKey,
+        baseUrl: env.baseUrl,
+        model: env.model,
+        prompt,
+        mode: env.mode,
+        overrides: env.overrides
+      });
+    } catch (err) {
+      // Fail-open em erro de infra: aborta as chamadas restantes, sem block.
+      logNote(`API error: ${err.message || err}`);
+      return;
+    }
+
+    debugChunks.push(`=== prompt (${i + 1}/${nBatches}) ===\n${prompt}\n\n=== response ===\n${result.content}\n`);
+    totals.latencyMs += result.latencyMs;
+    totals.promptTokens += result.usage.prompt_tokens ?? 0;
+    totals.completionTokens += result.usage.completion_tokens ?? 0;
+
+    const decision = parseDecision(result.content);
+    if (!decision) {
+      logNote(`unexpected response shape (parte ${i + 1}/${nBatches}); lote ignorado.`);
+      continue;
+    }
+    parsedAny = true;
+    (decision.allow ? allowReasons : blockReasons).push(decision.reason);
   }
 
   if (process.env.QWEN_REVIEW_DEBUG === "1") {
     fs.writeFileSync(
       path.join(workspaceRoot, ".qwen-review-debug.log"),
-      `=== prompt ===\n${prompt}\n\n=== response ===\n${result.content}\n`,
+      debugChunks.join("\n"),
       "utf8"
     );
   }
 
-  const decision = parseDecision(result.content);
-  if (!decision) {
+  if (!parsedAny) {
     logNote("unexpected response shape; gate skipped.");
     return;
   }
 
+  const blocked = blockReasons.length > 0;
+  const reason = joinReasons(blocked ? blockReasons : allowReasons);
+
   try {
     saveLastReview(workspaceRoot, {
       ts: new Date().toISOString(),
-      decision: decision.allow ? "allow" : "block",
-      reason: decision.reason,
+      decision: blocked ? "block" : "allow",
+      reason,
       model: env.model,
       mode: env.mode,
-      latencyMs: result.latencyMs,
-      promptTokens: result.usage.prompt_tokens,
-      completionTokens: result.usage.completion_tokens
+      calls: nBatches,
+      latencyMs: totals.latencyMs,
+      promptTokens: totals.promptTokens,
+      completionTokens: totals.completionTokens
     });
   } catch (err) {
     logNote(`could not persist lastReview: ${err.message || err}`);
   }
 
-  if (!decision.allow) {
-    emitBlock(`Qwen review found issues: ${decision.reason}`);
+  if (blocked) {
+    emitBlock(`Qwen review found issues: ${reason}`);
   }
 }
 

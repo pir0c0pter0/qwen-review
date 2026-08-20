@@ -6,6 +6,8 @@ trabalho revisável — devolva ALLOW imediatamente.
 Não bloqueie por edits de turns anteriores; só pelo que mudou agora.
 </task>
 
+<part_scope>{{PART_NOTE}}</part_scope>
+
 <previous_assistant_message>
 {{LAST_ASSISTANT}}
 </previous_assistant_message>
@@ -33,5 +35,6 @@ Nada antes dessa linha. Não use markdown na primeira linha.
 - Use `<changed_files_content>` para entender contexto além do diff (callers, tipos, invariantes
   declaradas mais acima no arquivo). Diff sem o arquivo cheio gera falso positivo.
 - Não invente: se o diff está vazio e o turno é status/setup → ALLOW.
+- Em review parcial (part_scope preenchido), julgue SOMENTE os arquivos deste lote.
 - Nunca eco literais que pareçam secret (AKIA…, sk-…, eyJ…, ghp_…).
 </rules>

@@ -1,34 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { makeTempGitRepo, makeTempDir, cleanup } from "./helpers/tempdir.mjs";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(__dirname, "..");
-const HOOK = path.join(ROOT_DIR, "scripts", "stop-review-hook.mjs");
-
-function runHook({ cwd, input = {}, env = {}, mockResponse }) {
-  const preload = path.join(ROOT_DIR, "test", "helpers", "mock-fetch-preload.mjs");
-  const result = spawnSync(
-    process.execPath,
-    ["--import", preload, HOOK],
-    {
-      cwd,
-      input: JSON.stringify(input),
-      env: {
-        ...process.env,
-        ...env,
-        MOCK_RESPONSE: mockResponse ? JSON.stringify(mockResponse) : ""
-      },
-      encoding: "utf8"
-    }
-  );
-  return result;
-}
+import { runHook, ROOT_DIR } from "./helpers/run-hook.mjs";
 
 test("hook is silent when gate is off", () => {
   const data = makeTempDir();
@@ -200,6 +176,36 @@ test("hook skips API call when assistant message and diff are both empty", () =>
   }
 });
 
+test("hook makes exactly 1 call on message-only turn (no changed files)", () => {
+  const data = makeTempDir();
+  const repo = makeTempGitRepo();
+  const captureFile = path.join(makeTempDir(), "captured.json");
+  try {
+    execSync(`node -e "import('${ROOT_DIR}/scripts/lib/config.mjs').then(m => m.setConfig('${repo}', 'stopReviewGate', true))"`, {
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: data }
+    });
+    const r = runHook({
+      cwd: repo,
+      env: {
+        CLAUDE_PLUGIN_DATA: data,
+        QWEN_API_KEY: "sk-test",
+        CAPTURE_FILE: captureFile
+      },
+      input: { cwd: repo, last_assistant_message: "explained the design, no edits", session_id: "s" },
+      mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
+    });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout.trim(), "", "ALLOW must not emit a block");
+    assert.doesNotMatch(r.stderr, /unexpected response shape/);
+    const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
+    assert.equal(captured.length, 1, "message-only turn: exactly one fetch call");
+  } finally {
+    cleanup(repo);
+    cleanup(data);
+    cleanup(path.dirname(captureFile));
+  }
+});
+
 test("hook redacts sk- key in last_assistant_message before sending", () => {
   const data = makeTempDir();
   const repo = makeTempGitRepo();
@@ -229,7 +235,7 @@ test("hook redacts sk- key in last_assistant_message before sending", () => {
     });
     assert.equal(r.status, 0);
     const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
-    const body = JSON.parse(captured.opts.body);
+    const body = JSON.parse(captured[0].opts.body);
     const sent = body.messages[0].content;
     assert.match(sent, /\[REDACTED:openai-or-qwen-key\]/);
     assert.doesNotMatch(sent, /sk-abcdefghij/);
@@ -275,10 +281,12 @@ test("hook reviews UNTRACKED new files (not shortcut-skipped, included in prompt
     const decision = JSON.parse(r.stdout.trim());
     assert.equal(decision.decision, "block");
     const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
-    const sent = JSON.parse(captured.opts.body).messages[0].content;
+    assert.equal(captured.length, 1, "single batch: exactly one fetch call");
+    const sent = JSON.parse(captured[0].opts.body).messages[0].content;
     assert.match(sent, /broken\.js/);
     assert.match(sent, /undefiend/);
     assert.match(sent, /new file mode|\+function broken/);
+    assert.doesNotMatch(sent, /Parte \d+\/\d+ deste review/);
   } finally {
     cleanup(repo);
     cleanup(data);
@@ -312,7 +320,7 @@ test("hook excludes UNTRACKED .env from diff body (no secret leak)", () => {
     });
     assert.equal(r.status, 0);
     const captured = JSON.parse(fs.readFileSync(captureFile, "utf8"));
-    const sent = JSON.parse(captured.opts.body).messages[0].content;
+    const sent = JSON.parse(captured[0].opts.body).messages[0].content;
     assert.match(sent, /\[diff excluded: sensitive path\]/);
     assert.match(sent, /\[file excluded: sensitive path\]/);
     assert.doesNotMatch(sent, /hunter2-not-a-known-token-pattern/);
@@ -356,7 +364,7 @@ test("tracked hardlinks do NOT leak via git diff", () => {
       mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
     });
     assert.equal(r.status, 0);
-    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8"))[0].opts.body).messages[0].content;
     // Tracked hardlink leak sentinel NEVER reaches the prompt
     assert.doesNotMatch(sent, /TRACKED_HARDLINK_LEAK_SENTINEL/);
     // Tracked file is excluded with placeholder
@@ -396,7 +404,7 @@ test("per-workspace mode override (state.config.mode) beats env QWEN_REVIEW_MODE
       mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
     });
     assert.equal(r.status, 0);
-    const body = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body);
+    const body = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8"))[0].opts.body);
     // thinking mode sends extra_body.enable_thinking=true and max_tokens=8192
     assert.equal(body.max_tokens, 8192, "workspace mode 'thinking' should override env 'fast'");
     assert.deepEqual(body.extra_body, { enable_thinking: true });
@@ -432,7 +440,7 @@ test("hook never reads through hardlinks (target may be outside repo)", () => {
       mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
     });
     assert.equal(r.status, 0);
-    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8"))[0].opts.body).messages[0].content;
     // Hardlinked content NEVER reaches the prompt
     assert.doesNotMatch(sent, /DO_NOT_LEAK_VIA_HARDLINK_FROM_OUTSIDE/);
     // Hardlink is mentioned but excluded
@@ -474,7 +482,7 @@ test("hook never reads through symlinks (target may be outside repo)", () => {
       mockResponse: { status: 200, body: { choices: [{ message: { content: "ALLOW: ok" } }] } }
     });
     assert.equal(r.status, 0);
-    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8")).opts.body).messages[0].content;
+    const sent = JSON.parse(JSON.parse(fs.readFileSync(captureFile, "utf8"))[0].opts.body).messages[0].content;
     // Symlink target content NEVER reaches the prompt
     assert.doesNotMatch(sent, /DO_NOT_LEAK_THIS_FROM_OUTSIDE_THE_REPO/);
     // The link itself is mentioned as excluded

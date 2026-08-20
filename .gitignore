@@ -1,5 +1,6 @@
 .env
 node_modules/
+.claude-flow/
 .qwen-review-debug.log
 *.log
 .DS_Store
